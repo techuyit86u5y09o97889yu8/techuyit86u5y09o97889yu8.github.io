@@ -42,45 +42,22 @@ const MODEL = 'Xenova/detr-resnet-50-panoptic';
 
 let segmenter, img, results = [];
 
-const progress = p => {
-  if (p.status === 'progress') statusEl.textContent = `Descargando modelo… ${Math.round(p.progress)}%`;
-};
-
-// Recarga la página forzando WASM (estado limpio, sin restos del fallo de WebGPU)
-function reloadWithWasm(msg) {
-  statusEl.textContent = msg;
-  setTimeout(() => { location.search = '?wasm'; }, 1500);
-}
-
-async function pickDevice() {
-  if (new URLSearchParams(location.search).has('wasm')) return 'wasm';
-  if (!navigator.gpu) return 'wasm';
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    return adapter ? 'webgpu' : 'wasm';
-  } catch {
-    return 'wasm';
-  }
-}
-
-async function makePipeline(device) {
-  const p = await pipeline('image-segmentation', MODEL, { device, progress_callback: progress });
-  const ip = p.processor?.image_processor;
-  if (ip) ip.size = { shortest_edge: 384, longest_edge: 512 };
-  return p;
-}
-
 async function loadModel() {
-  const device = await pickDevice();
   try {
-    segmenter = await makePipeline(device);
-    statusEl.textContent = device === 'webgpu'
-      ? 'Modelo listo (WebGPU). Sube una foto.'
-      : 'Modelo listo (WASM, más lento). Sube una foto.';
+    segmenter = await pipeline('image-segmentation', MODEL, {
+      device: 'wasm',
+      dtype: 'q8',
+      progress_callback: p => {
+        if (p.status === 'progress') statusEl.textContent = `Descargando modelo… ${Math.round(p.progress)}%`;
+      }
+    });
+    // Menor resolución = inferencia más rápida en CPU
+    const ip = segmenter.processor?.image_processor;
+    if (ip) ip.size = { shortest_edge: 384, longest_edge: 512 };
+    statusEl.textContent = 'Modelo listo (WASM). Sube una foto.';
   } catch (e) {
     console.error(e);
-    if (device === 'webgpu') reloadWithWasm('WebGPU falló. Recargando en modo WASM…');
-    else statusEl.textContent = 'Error cargando el modelo: ' + e.message;
+    statusEl.textContent = 'Error cargando el modelo: ' + e.message;
   }
 }
 
@@ -132,7 +109,7 @@ $('file').addEventListener('change', async e => {
       results = await segmenter(url);
     } catch (err) {
       console.error(err);
-      reloadWithWasm('La GPU falló. Recargando en modo WASM, vuelve a subir la foto…');
+      statusEl.textContent = 'Error al segmentar: ' + err.message;
       return;
     }
     statusEl.textContent = `Listo en ${((performance.now() - t0) / 1000).toFixed(1)} s. Elige un objeto.`;
