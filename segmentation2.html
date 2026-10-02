@@ -46,14 +46,14 @@ async function loadModel() {
   try {
     segmenter = await pipeline('image-segmentation', MODEL, {
       device: 'wasm',
-      dtype: 'q8',
+      dtype: 'fp16',
       progress_callback: p => {
         if (p.status === 'progress') statusEl.textContent = `Descargando modelo… ${Math.round(p.progress)}%`;
       }
     });
     // Menor resolución = inferencia más rápida en CPU
     const ip = segmenter.processor?.image_processor;
-    if (ip) ip.size = { shortest_edge: 384, longest_edge: 512 };
+    if (ip) ip.size = { shortest_edge: 800, longest_edge: 1333 };
     statusEl.textContent = 'Modelo listo (WASM). Sube una foto.';
   } catch (e) {
     console.error(e);
