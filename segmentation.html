@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Segmentador de fotos</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #f4f4f6; color: #222; }
+  h1 { font-size: 1.3rem; margin: 0 0 12px; }
+  #status { margin: 10px 0; font-size: .9rem; color: #555; }
+  main { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  #stage { flex: 1 1 400px; background: #fff; padding: 10px; border-radius: 10px; }
+  canvas { max-width: 100%; height: auto; display: block; border-radius: 6px; }
+  #panel { flex: 0 0 220px; background: #fff; padding: 10px; border-radius: 10px; }
+  #list { list-style: none; padding: 0; margin: 0; }
+  #list li { padding: 8px 10px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; }
+  #list li:hover { background: #eef; }
+  #list li.active { background: #4f46e5; color: #fff; }
+  small { opacity: .7; }
+</style>
+</head>
+<body>
+<h1>Segmentador de fotos (WebGPU)</h1>
+<input type="file" id="file" accept="image/jpeg,image/png">
+<div id="status">Cargando modelo…</div>
+
+<main>
+  <div id="stage"><canvas id="canvas" width="400" height="300"></canvas></div>
+  <div id="panel">
+    <strong>Objetos detectados</strong>
+    <ul id="list"><li><small>Sube una foto</small></li></ul>
+  </div>
+</main>
+
+<script type="module">
+import { pipeline, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
+
+const $ = id => document.getElementById(id);
+const canvas = $('canvas'), ctx = canvas.getContext('2d');
+const statusEl = $('status'), listEl = $('list');
+const MODEL = 'Xenova/detr-resnet-50-panoptic';
+
+let segmenter, img, results = [];
+
+const progress = p => {
+  if (p.status === 'progress') statusEl.textContent = `Descargando modelo… ${Math.round(p.progress)}%`;
+};
+
+async function makePipeline(device) {
+  const p = await pipeline('image-segmentation', MODEL, { device, progress_callback: progress });
+  // Por defecto DETR escala la imagen a ~800-1333 px, demasiado para la GPU. Lo reducimos.
+  const ip = p.processor?.image_processor;
+  if (ip) ip.size = { shortest_edge: 384, longest_edge: 512 };
+  return p;
+}
+
+async function loadModel() {
+  try {
+    if (!navigator.gpu) throw new Error('sin WebGPU');
+    segmenter = await makePipeline('webgpu');
+    statusEl.textContent = 'Modelo listo (WebGPU). Sube una foto.';
+  } catch (e) {
+    console.warn('WebGPU falló, usando WASM:', e);
+    segmenter = await makePipeline('wasm');
+    statusEl.textContent = 'Modelo listo (WASM, más lento). Sube una foto.';
+  }
+}
+
+function drawBase() {
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+}
+
+function highlight(i) {
+  drawBase();
+  [...listEl.children].forEach((li, k) => li.classList.toggle('active', k === i));
+  const { mask } = results[i];
+  // Capa de color con la forma exacta de la máscara
+  const layer = document.createElement('canvas');
+  layer.width = mask.width; layer.height = mask.height;
+  const lctx = layer.getContext('2d');
+  const data = lctx.createImageData(mask.width, mask.height);
+  const ch = mask.channels || 1;
+  for (let p = 0; p < mask.width * mask.height; p++) {
+    if (mask.data[p * ch] > 127) {
+      data.data.set([255, 40, 80, 150], p * 4); // rojo semitransparente
+    }
+  }
+  lctx.putImageData(data, 0, 0);
+  ctx.drawImage(layer, 0, 0, canvas.width, canvas.height);
+}
+
+function renderList() {
+  listEl.innerHTML = '';
+  if (!results.length) { listEl.innerHTML = '<li><small>Nada detectado</small></li>'; return; }
+  results.forEach((r, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>${r.label}</span><small>${Math.round(r.score * 100)}%</small>`;
+    li.onclick = () => highlight(i);
+    listEl.appendChild(li);
+  });
+}
+
+$('file').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file || !segmenter) return;
+  const url = URL.createObjectURL(file);
+  img = new Image();
+  img.onload = async () => {
+    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+    drawBase();
+    listEl.innerHTML = '<li><small>Analizando…</small></li>';
+    statusEl.textContent = 'Segmentando…';
+    const t0 = performance.now();
+    try {
+      results = await segmenter(url);
+    } catch (err) {
+      console.warn('Falló la inferencia en GPU, reintentando con WASM:', err);
+      statusEl.textContent = 'La GPU falló. Reintentando con WASM (más lento)…';
+      segmenter = await makePipeline('wasm');
+      results = await segmenter(url);
+    }
+    statusEl.textContent = `Listo en ${((performance.now() - t0) / 1000).toFixed(1)} s. Elige un objeto.`;
+    renderList();
+  };
+  img.src = url;
+});
+
+loadModel();
+</script>
+</body>
+</html>
