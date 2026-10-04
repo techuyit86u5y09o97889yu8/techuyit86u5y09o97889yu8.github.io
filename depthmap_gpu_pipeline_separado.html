@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Profundidad (Depth Anything V2 Small fp16, WebGPU)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #f4f4f6; color: #222; }
+  h1 { font-size: 1.3rem; margin: 0 0 12px; }
+  #status { margin: 10px 0; font-size: .9rem; color: #555; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+  button { padding: 8px 14px; border: 0; border-radius: 6px; background: #e3e3ea; cursor: pointer; font-size: .9rem; }
+  button:hover:not(:disabled) { background: #d4d4e0; }
+  button.active { background: #4f46e5; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #sliderBox { display: none; align-items: center; gap: 8px; font-size: .9rem; }
+  #sliderBox.on { display: flex; }
+  #stage { background: #fff; padding: 10px; border-radius: 10px; display: inline-block; max-width: 100%; box-sizing: border-box; }
+  canvas {
+    max-width: 100%; height: auto; display: block; border-radius: 6px;
+    background-color: #fff;
+    background-image:
+      linear-gradient(45deg, #ccc 25%, transparent 25%, transparent 75%, #ccc 75%),
+      linear-gradient(45deg, #ccc 25%, transparent 25%, transparent 75%, #ccc 75%);
+    background-size: 20px 20px;
+    background-position: 0 0, 10px 10px;
+  }
+</style>
+</head>
+<body>
+<h1>Profundidad (Depth Anything V2 Small, fp16, WebGPU)</h1>
+<input type="file" id="file" accept="image/jpeg,image/png" disabled>
+<div id="status">Iniciando…</div>
+
+<div class="bar">
+  <button id="bOrig" disabled>Original</button>
+  <button id="bDepth" disabled>Profundidad</button>
+  <button id="bCut" disabled>Recorte por profundidad</button>
+  <button id="bDl" disabled>Descargar PNG</button>
+  <label id="sliderBox">Umbral
+    <input type="range" id="thr" min="0" max="100" value="40">
+    <span id="thrVal">40</span>
+  </label>
+</div>
+
+<div id="stage"><canvas id="canvas" width="400" height="300"></canvas></div>
+
+<script type="module">
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs';
+
+const MODEL_URL = 'https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx';
+const CACHE_NAME = 'modelos-onnx';
+
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+
+const $ = id => document.getElementById(id);
+const canvas = $('canvas'), ctx = canvas.getContext('2d');
+const statusEl = $('status');
+const btns = { orig: $('bOrig'), depth: $('bDepth'), cut: $('bCut') };
+const SIZE = 518;
+const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
+const SOFT = 0.08;
+
+let session, img, mode = 'orig';
+let depth = null, dW = SIZE, dH = SIZE;
+let depthView = null, cutout = null;
+
+// Descarga con progreso y caché del navegador (para no bajar 50 MB cada vez)
+async function fetchModel(url) {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const hit = await cache.match(url);
+    if (hit) { statusEl.textContent = 'Modelo en caché…'; return new Uint8Array(await hit.arrayBuffer()); }
+  } catch {}
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status + ' al descargar el modelo');
+  const total = +res.headers.get('content-length') || 0;
+  const reader = res.body.getReader();
+  const chunks = []; let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    statusEl.textContent = total
+      ? `Descargando modelo… ${Math.round(got / total * 100)}%`
+      : `Descargando modelo… ${(got / 1048576).toFixed(1)} MB`;
+  }
+  const blob = new Blob(chunks);
+  try { (await caches.open(CACHE_NAME)).put(url, new Response(blob)); } catch {}
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function loadModel() {
+  if (!navigator.gpu || !(await navigator.gpu.requestAdapter())) {
+    statusEl.textContent = 'WebGPU no disponible: el navegador no devuelve un adaptador de GPU (revisa chrome://gpu).';
+    return;
+  }
+  try {
+    const bytes = await fetchModel(MODEL_URL);
+    statusEl.textContent = 'Inicializando WebGPU…';
+    session = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu'] });
+    // Calentamiento: compila shaders y pipelines con una entrada vacía de la misma forma
+    statusEl.textContent = 'Preparando pipelines…';
+    const t0 = performance.now();
+    const res = await session.run({
+      [session.inputNames[0]]: new ort.Tensor('float32', new Float32Array(3 * SIZE * SIZE), [1, 3, SIZE, SIZE]),
+    });
+    await res[session.outputNames[0]].getData(); // espera a que la GPU termine
+    statusEl.textContent = `Modelo listo (WebGPU, preparado en ${((performance.now() - t0) / 1000).toFixed(1)} s). Sube una foto.`;
+    $('file').disabled = false;
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = 'Error cargando el modelo: ' + e.message;
+  }
+}
+
+function preprocess() {
+  const c = document.createElement('canvas');
+  c.width = c.height = SIZE;
+  const cx = c.getContext('2d');
+  cx.drawImage(img, 0, 0, SIZE, SIZE);
+  const px = cx.getImageData(0, 0, SIZE, SIZE).data;
+  const n = SIZE * SIZE, out = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++)
+    for (let ch = 0; ch < 3; ch++)
+      out[ch * n + i] = (px[i * 4 + ch] / 255 - MEAN[ch]) / STD[ch];
+  return new ort.Tensor('float32', out, [1, 3, SIZE, SIZE]);
+}
+
+// float16 (Uint16Array) -> número
+function half2float(h) {
+  const s = h & 0x8000 ? -1 : 1, e = (h & 0x7C00) >> 10, f = h & 0x03FF;
+  if (e === 0) return s * 2 ** -14 * (f / 1024);
+  if (e === 0x1F) return f ? NaN : s * Infinity;
+  return s * 2 ** (e - 15) * (1 + f / 1024);
+}
+
+async function estimateDepth() {
+  const res = await session.run({ [session.inputNames[0]]: preprocess() });
+  const t = res[session.outputNames[0]];
+  const raw = await t.getData(); // espera a que la GPU termine
+  const d = raw instanceof Uint16Array ? Float32Array.from(raw, half2float) : raw;
+  dH = t.dims[t.dims.length - 2];
+  dW = t.dims[t.dims.length - 1];
+  let min = Infinity, max = -Infinity;
+  for (const v of d) { if (v < min) min = v; if (v > max) max = v; }
+  depth = new Float32Array(d.length);
+  for (let i = 0; i < d.length; i++) depth[i] = (d[i] - min) / (max - min || 1);
+}
+
+function scaleToOriginal(fillPixel) {
+  const small = document.createElement('canvas');
+  small.width = dW; small.height = dH;
+  const sctx = small.getContext('2d');
+  const id = sctx.createImageData(dW, dH);
+  for (let i = 0; i < depth.length; i++) id.data.set(fillPixel(depth[i]), i * 4);
+  sctx.putImageData(id, 0, 0);
+
+  const big = document.createElement('canvas');
+  big.width = img.naturalWidth; big.height = img.naturalHeight;
+  const bctx = big.getContext('2d');
+  bctx.imageSmoothingEnabled = true;
+  bctx.imageSmoothingQuality = 'high';
+  bctx.drawImage(small, 0, 0, big.width, big.height);
+  return big;
+}
+
+function buildDepthView() {
+  depthView = scaleToOriginal(v => { const g = Math.round(v * 255); return [g, g, g, 255]; });
+}
+
+function buildCutout() {
+  const t = $('thr').value / 100;
+  const alphaMap = scaleToOriginal(v => {
+    const a = Math.min(1, Math.max(0, (v - t) / SOFT + 0.5));
+    return [255, 255, 255, Math.round(a * 255)];
+  });
+  cutout = document.createElement('canvas');
+  cutout.width = img.naturalWidth; cutout.height = img.naturalHeight;
+  const cctx = cutout.getContext('2d');
+  cctx.drawImage(img, 0, 0);
+  cctx.globalCompositeOperation = 'destination-in';
+  cctx.drawImage(alphaMap, 0, 0);
+}
+
+function show(m) {
+  mode = m;
+  const src = m === 'orig' ? img : m === 'depth' ? depthView : cutout;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(src, 0, 0, canvas.width, canvas.height);
+  for (const k in btns) btns[k].classList.toggle('active', k === m);
+  $('sliderBox').classList.toggle('on', m === 'cut');
+}
+
+btns.orig.onclick = () => show('orig');
+btns.depth.onclick = () => show('depth');
+btns.cut.onclick = () => { buildCutout(); show('cut'); };
+
+$('thr').addEventListener('input', e => {
+  $('thrVal').textContent = e.target.value;
+  if (depth && mode === 'cut') { buildCutout(); show('cut'); }
+});
+
+$('bDl').onclick = () => {
+  const src = mode === 'depth' ? depthView : (buildCutout(), cutout);
+  src.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = mode === 'depth' ? 'profundidad.png' : 'recorte.png';
+    a.click();
+  }, 'image/png');
+};
+
+$('file').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file || !session) return;
+  img = new Image();
+  img.onload = async () => {
+    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+    ctx.drawImage(img, 0, 0);
+    [...Object.values(btns), $('bDl')].forEach(b => b.disabled = true);
+    statusEl.textContent = 'Calculando profundidad…';
+    const t0 = performance.now();
+    try {
+      await estimateDepth();
+      buildDepthView();
+    } catch (err) {
+      console.error(err);
+      statusEl.textContent = 'Error: ' + err.message;
+      return;
+    }
+    [...Object.values(btns), $('bDl')].forEach(b => b.disabled = false);
+    statusEl.textContent = `Listo en ${((performance.now() - t0) / 1000).toFixed(1)} s. Blanco = más cerca.`;
+    show('depth');
+  };
+  img.src = URL.createObjectURL(file);
+});
+
+loadModel();
+</script>
+</body>
+</html>
