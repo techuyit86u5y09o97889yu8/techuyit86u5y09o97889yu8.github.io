@@ -71,6 +71,495 @@
   <div class="hint">Enter envía · Shift+Enter nueva línea. Un modelo de 0.5B puede equivocarse.</div>
 </footer>
 
+<script type="module">
+import {
+  pipeline,
+  TextStreamer,
+  env
+} from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm";
 
+/* =========================================================
+   CONFIG
+========================================================= */
+
+const MODEL_ID = "onnx-community/SmolLM-135M-Instruct-ONNX";
+
+const MAX_NEW_TOKENS = 256;
+const NUM_THREADS = 4;
+
+/*
+ * SmolLM-135M-Instruct:
+ *
+ * hidden_size          = 576
+ * layers               = 30
+ * attention_heads      = 9
+ * kv_heads             = 3
+ * head_dim             = 64
+ * context              = 2048
+ * vocab                = 49152
+ *
+ * No necesitamos declarar estos valores manualmente:
+ * Transformers.js los obtiene de config.json.
+ */
+
+/* =========================================================
+   WASM
+========================================================= */
+
+env.backends.onnx.wasm.numThreads = NUM_THREADS;
+
+/*
+ * El modelo se mantiene remoto y Transformers.js
+ * utiliza su caché del navegador.
+ */
+env.allowRemoteModels = true;
+env.allowLocalModels = false;
+env.useWasmCache = true;
+
+/* =========================================================
+   ELEMENTOS HTML
+   Intentamos encontrar los nombres habituales para no
+   obligarte a modificar tu HTML.
+========================================================= */
+
+const input =
+  document.querySelector("#userInput") ||
+  document.querySelector("#prompt") ||
+  document.querySelector("#messageInput") ||
+  document.querySelector("textarea") ||
+  document.querySelector("input[type='text']");
+
+const sendButton =
+  document.querySelector("#sendBtn") ||
+  document.querySelector("#sendButton") ||
+  document.querySelector("#send") ||
+  document.querySelector("button[type='submit']");
+
+const chat =
+  document.querySelector("#chat") ||
+  document.querySelector("#messages") ||
+  document.querySelector("#chatMessages") ||
+  document.querySelector(".chat");
+
+const status =
+  document.querySelector("#status") ||
+  document.querySelector("#modelStatus") ||
+  document.querySelector("#loadingStatus");
+
+const progress =
+  document.querySelector("#progress") ||
+  document.querySelector("#downloadProgress");
+
+if (!input) {
+  console.error("No se encontró el campo de entrada.");
+}
+
+if (!sendButton) {
+  console.error("No se encontró el botón de enviar.");
+}
+
+if (!chat) {
+  console.error("No se encontró el contenedor del chat.");
+}
+
+/* =========================================================
+   ESTADO
+========================================================= */
+
+let generator = null;
+let modelReady = false;
+let generating = false;
+
+/* =========================================================
+   UI
+========================================================= */
+
+function setStatus(text) {
+  if (status) {
+    status.textContent = text;
+  }
+
+  console.log("[SmolLM]", text);
+}
+
+function setProgress(value, text = null) {
+  const percent = Math.max(0, Math.min(100, value));
+
+  if (progress) {
+    /*
+     * Funciona tanto si #progress es <progress>
+     * como si es un elemento normal.
+     */
+    if ("value" in progress) {
+      progress.value = percent;
+    }
+
+    progress.style.width = `${percent}%`;
+
+    if (text) {
+      progress.textContent = text;
+    }
+  }
+
+  if (status && text) {
+    status.textContent = text;
+  }
+}
+
+function escapeHTML(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function addMessage(role, text) {
+  if (!chat) return null;
+
+  const wrapper = document.createElement("div");
+
+  wrapper.className =
+    role === "user"
+      ? "message user-message"
+      : "message assistant-message";
+
+  wrapper.dataset.role = role;
+
+  wrapper.innerHTML = `
+    <div class="message-content">${escapeHTML(text)}</div>
+  `;
+
+  chat.appendChild(wrapper);
+
+  chat.scrollTop = chat.scrollHeight;
+
+  return wrapper.querySelector(".message-content");
+}
+
+/* =========================================================
+   PROGRESO DE DESCARGA
+========================================================= */
+
+function handleProgress(info) {
+  if (!info) return;
+
+  /*
+   * Transformers.js proporciona información de progreso
+   * durante la descarga/carga de los archivos.
+   */
+  if (typeof info.progress === "number") {
+    const percent = info.progress;
+
+    let label = `Descargando modelo: ${percent.toFixed(1)}%`;
+
+    if (info.file) {
+      label += ` — ${info.file}`;
+    }
+
+    setProgress(percent, label);
+    return;
+  }
+
+  /*
+   * Algunos eventos informan del archivo que se está
+   * cargando pero todavía no tienen porcentaje.
+   */
+  if (info.status === "initiate") {
+    setStatus(
+      info.file
+        ? `Preparando ${info.file}...`
+        : "Preparando modelo..."
+    );
+  }
+
+  if (info.status === "done") {
+    if (info.file) {
+      setStatus(`Cargado: ${info.file}`);
+    }
+  }
+}
+
+/* =========================================================
+   CREACIÓN DEL PIPELINE
+========================================================= */
+
+async function loadModel() {
+  if (generator) {
+    return generator;
+  }
+
+  setStatus("Inicializando WASM...");
+  setProgress(0, "Inicializando WASM...");
+
+  /*
+   * q8:
+   *
+   * Transformers.js busca la variante cuantizada.
+   * En este repo corresponde a:
+   *
+   * onnx/model_quantized.onnx
+   *
+   * ~136 MB
+   *
+   * No utilizamos model_int8.onnx directamente.
+   */
+  generator = await pipeline(
+    "text-generation",
+    MODEL_ID,
+    {
+      device: "wasm",
+      dtype: "q8",
+
+      progress_callback: handleProgress
+    }
+  );
+
+  setStatus("Modelo cargado. Preparando WASM...");
+
+  return generator;
+}
+
+/* =========================================================
+   WARM-UP
+========================================================= */
+
+async function warmup() {
+  if (!generator) {
+    await loadModel();
+  }
+
+  setStatus("Calentando el modelo...");
+
+  /*
+   * Una generación mínima fuerza a preparar:
+   *
+   * - tokenizer
+   * - modelo
+   * - sesión ONNX
+   * - backend WASM
+   * - operadores
+   * - memoria interna
+   *
+   * No guardamos este contexto para las siguientes
+   * preguntas.
+   */
+  await generator(
+    [
+      {
+        role: "user",
+        content: "Hola"
+      }
+    ],
+    {
+      max_new_tokens: 1,
+      do_sample: false
+    }
+  );
+
+  modelReady = true;
+
+  setProgress(100, "Modelo listo");
+
+  console.log(
+    `[SmolLM] listo — WASM ${NUM_THREADS} hilos`
+  );
+}
+
+/* =========================================================
+   GENERACIÓN
+========================================================= */
+
+async function generateAnswer(text, outputElement) {
+  if (!generator || !modelReady) {
+    throw new Error("El modelo todavía no está listo.");
+  }
+
+  let generatedText = "";
+
+  const streamer = new TextStreamer(
+    generator.tokenizer,
+    {
+      skip_prompt: true,
+
+      callback_function: (token) => {
+        if (!token) return;
+
+        generatedText += token;
+
+        /*
+         * Actualizamos únicamente el contenido del mensaje.
+         *
+         * NO reconstruimos todo el chat con innerHTML.
+         * Esto evita gran parte del lag que tenías antes.
+         */
+        if (outputElement) {
+          outputElement.textContent = generatedText;
+
+          if (chat) {
+            chat.scrollTop = chat.scrollHeight;
+          }
+        }
+      }
+    }
+  );
+
+  /*
+   * IMPORTANTE:
+   *
+   * Solo pasamos el mensaje actual.
+   *
+   * No hay history.
+   * No se reutilizan conversaciones anteriores.
+   */
+  await generator(
+    [
+      {
+        role: "user",
+        content: text
+      }
+    ],
+    {
+      max_new_tokens: MAX_NEW_TOKENS,
+
+      do_sample: true,
+      temperature: 0.7,
+      top_p: 0.9,
+
+      streamer
+    }
+  );
+
+  return generatedText;
+}
+
+/* =========================================================
+   ENVIAR
+========================================================= */
+
+async function sendMessage() {
+  if (generating) return;
+  if (!modelReady) return;
+
+  if (!input) return;
+
+  const text = input.value.trim();
+
+  if (!text) return;
+
+  generating = true;
+
+  /*
+   * No usamos Stop.
+   * Simplemente bloqueamos otro envío mientras
+   * la generación está en curso.
+   */
+  if (sendButton) {
+    sendButton.disabled = true;
+  }
+
+  input.disabled = true;
+
+  addMessage("user", text);
+
+  const outputElement = addMessage("assistant", "");
+
+  input.value = "";
+
+  setStatus("Generando...");
+
+  const startTime = performance.now();
+
+  try {
+    await generateAnswer(text, outputElement);
+
+    const elapsed =
+      ((performance.now() - startTime) / 1000).toFixed(2);
+
+    setStatus(`Listo · ${elapsed}s`);
+  } catch (error) {
+    console.error(error);
+
+    if (outputElement) {
+      outputElement.textContent =
+        "Error durante la generación: " +
+        (error?.message || error);
+    }
+
+    setStatus("Error durante la generación.");
+  }
+
+  input.disabled = false;
+
+  if (sendButton) {
+    sendButton.disabled = false;
+  }
+
+  generating = false;
+
+  input.focus();
+}
+
+/* =========================================================
+   EVENTOS
+========================================================= */
+
+if (sendButton) {
+  sendButton.addEventListener("click", (event) => {
+    event.preventDefault();
+    sendMessage();
+  });
+}
+
+if (input) {
+  input.addEventListener("keydown", (event) => {
+    /*
+     * Enter = enviar
+     * Shift+Enter = nueva línea
+     */
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey
+    ) {
+      event.preventDefault();
+      sendMessage();
+    }
+  });
+}
+
+/* =========================================================
+   INICIO
+========================================================= */
+
+(async () => {
+  try {
+    await loadModel();
+
+    await warmup();
+
+    if (input) {
+      input.disabled = false;
+      input.focus();
+    }
+
+    if (sendButton) {
+      sendButton.disabled = false;
+    }
+
+  } catch (error) {
+    console.error(
+      "[SmolLM] Error inicializando:",
+      error
+    );
+
+    setStatus(
+      "Error cargando el modelo: " +
+      (error?.message || error)
+    );
+
+    if (sendButton) {
+      sendButton.disabled = true;
+    }
+  }
+})();
+</script>
 </body>
 </html>
