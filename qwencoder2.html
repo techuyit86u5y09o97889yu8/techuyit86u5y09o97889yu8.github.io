@@ -98,7 +98,6 @@ let generator = null;
 let generating = false;
 let stopFlag = false;
 
-const history = [];
 
 /* ================================================================
    Carga del modelo
@@ -420,11 +419,6 @@ async function send() {
 
   addRow('user', text);
 
-  history.push({
-    role: 'user',
-    content: text
-  });
-
   const bubble = addRow('bot');
 
   render(
@@ -476,13 +470,6 @@ async function send() {
 
   chat.scrollTop =
     chat.scrollHeight;
-
-  if (answer) {
-    history.push({
-      role: 'assistant',
-      content: answer
-    });
-  }
 
   const seconds =
     (performance.now() - t0) / 1000;
