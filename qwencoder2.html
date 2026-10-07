@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<script src="coi-serviceworker.js"></script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat Qwen2.5-Coder 0.5B (ORT WASM)</title>
+<style>
+  :root {
+    --bg: #212121; --panel: #2f2f2f; --text: #ececec; --muted: #9b9b9b;
+    --border: #3a3a3a; --accent: #10a37f; --code-bg: #0d0d0d; --code-head: #1e1e1e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex;
+           justify-content: space-between; align-items: center; font-size: .95rem; }
+  header .title { font-weight: 600; }
+  #status { color: var(--muted); font-size: .8rem; }
+  #chat { flex: 1; overflow-y: auto; padding: 20px 0; }
+  .row { max-width: 760px; margin: 0 auto; padding: 10px 20px; display: flex; gap: 14px; }
+  .row.user { justify-content: flex-end; }
+  .avatar { flex: none; width: 28px; height: 28px; border-radius: 50%; background: var(--accent);
+            display: grid; place-items: center; font-size: .75rem; font-weight: 700; color: #fff; margin-top: 2px; }
+  .bubble { min-width: 0; line-height: 1.6; font-size: .97rem; }
+  .row.user .bubble { background: var(--panel); padding: 10px 16px; border-radius: 18px; max-width: 80%;
+                      white-space: pre-wrap; overflow-wrap: anywhere; }
+  .row.bot .bubble { flex: 1; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+  .text + .codeblock, .codeblock + .text { margin-top: 10px; }
+  .text code { background: #3a3a3a; padding: 1px 6px; border-radius: 4px; font-family: ui-monospace, Consolas, monospace; font-size: .88em; }
+  .codeblock { background: var(--code-bg); border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
+  .codehead { background: var(--code-head); display: flex; justify-content: space-between; align-items: center;
+              padding: 6px 12px; font-size: .78rem; color: var(--muted); }
+  .codehead button { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: .78rem; }
+  .codehead button:hover { color: var(--text); }
+  pre { margin: 0; padding: 14px; overflow-x: auto; }
+  pre code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .86rem;
+             line-height: 1.5; white-space: pre; tab-size: 4; display: block; }
+  .typing::after { content: "▍"; animation: blink 1s steps(2) infinite; margin-left: 2px; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #empty { text-align: center; margin-top: 18vh; color: var(--muted); }
+  #empty h2 { color: var(--text); font-weight: 600; }
+  footer { padding: 10px 20px 18px; }
+  #composer { max-width: 760px; margin: 0 auto; background: var(--panel); border-radius: 26px;
+              display: flex; align-items: flex-end; padding: 8px 8px 8px 18px; gap: 8px; }
+  #input { flex: 1; background: none; border: 0; outline: 0; color: var(--text); font: inherit;
+           resize: none; max-height: 200px; padding: 8px 0; line-height: 1.4; }
+  #send { width: 36px; height: 36px; border-radius: 50%; border: 0; background: #fff; color: #000;
+          cursor: pointer; font-size: 1rem; flex: none; }
+  #send:disabled { opacity: .35; cursor: default; }
+  .hint { text-align: center; color: var(--muted); font-size: .72rem; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">Qwen2.5-Coder 0.5B</span>
+  <span id="status">Cargando modelo…</span>
+</header>
+
+<div id="chat">
+  <div id="empty"><h2>¿En qué puedo ayudarte?</h2><p>Modelo local ejecutándose en tu navegador (WASM).</p></div>
+</div>
+
+<footer>
+  <div id="composer">
+    <textarea id="input" rows="1" placeholder="Escribe un mensaje…" disabled></textarea>
+    <button id="send" disabled title="Enviar">➤</button>
+  </div>
+  <div class="hint">Enter envía · Shift+Enter nueva línea. Un modelo de 0.5B puede equivocarse.</div>
+</footer>
+
+<script type="module">
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs';
+
+const MODEL_URL = 'https://huggingface.co/onnx-community/Qwen2.5-Coder-0.5B-Instruct/resolve/main/onnx/model_q4f16.onnx';
+const TOKENIZER_URL = 'https://huggingface.co/onnx-community/Qwen2.5-Coder-0.5B-Instruct/resolve/main/tokenizer.json';
+
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+ort.env.wasm.numThreads = navigator.hardwareConcurrency || 1;
+
+// Arquitectura de Qwen2.5-Coder-0.5B
+const KV_HEADS = 2, HEAD_DIM = 64;
+const FP16 = /f16|fp16/i.test(MODEL_URL);       // la caché KV debe coincidir con el dtype del modelo
+const PREFILL_CHUNK = 64;                       // el prompt se procesa en trozos para no inflar los logits
+const MAX_CTX = 2048, MAX_NEW = 1024;
+const TEMP = 0.4, TOP_K = 40, TOP_P = 0.9, REP_PEN = 1.05;
+const SYSTEM = 'Eres un asistente útil. Responde en el idioma del usuario. Cuando muestres código, usa bloques con ``` y el nombre del lenguaje.';
+
+const $ = id => document.getElementById(id);
+const chat = $('chat'), input = $('input'), sendBtn = $('send'), statusEl = $('status');
+
+let session = null, generating = false, stopFlag = false;
+const history = [];
+
+/* =====================================================================
+   Tokenizador BPE byte-level (Qwen2)
+   ===================================================================== */
+const tok = { vocab: null, ranks: null, idToTok: [], added: new Map(), cache: new Map() };
+const byteToChar = [], charToByte = {};
+(function () {
+  const bs = [];
+  for (let i = 33; i <= 126; i++) bs.push(i);
+  for (let i = 161; i <= 172; i++) bs.push(i);
+  for (let i = 174; i <= 255; i++) bs.push(i);
+  const cs = bs.slice(); let n = 0;
+  for (let b = 0; b < 256; b++) if (!bs.includes(b)) { bs.push(b); cs.push(256 + n++); }
+  bs.forEach((b, i) => { const ch = String.fromCharCode(cs[i]); byteToChar[b] = ch; charToByte[ch] = b; });
+})();
+
+const PAT = /(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu;
+const utf8 = new TextEncoder(), utf8dec = new TextDecoder('utf-8');
+
+async function loadTokenizer() {
+  const j = await (await fetch(TOKENIZER_URL)).json();
+  tok.vocab = new Map(Object.entries(j.model.vocab));
+  for (const [t, id] of tok.vocab) tok.idToTok[id] = t;
+  tok.ranks = new Map();
+  j.model.merges.forEach((m, i) => tok.ranks.set(Array.isArray(m) ? m.join(' ') : m, i));
+  for (const a of j.added_tokens) tok.added.set(a.id, a);
+  tok.IM_START = j.added_tokens.find(a => a.content === '<|im_start|>').id;
+  tok.IM_END = j.added_tokens.find(a => a.content === '<|im_end|>').id;
+  tok.EOT = j.added_tokens.find(a => a.content === '<|endoftext|>').id;
+}
+
+function bpe(word) {
+  let hit = tok.cache.get(word);
+  if (hit) return hit;
+  const parts = Array.from(word);
+  while (parts.length > 1) {
+    let best = Infinity, bi = -1;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const r = tok.ranks.get(parts[i] + ' ' + parts[i + 1]);
+      if (r !== undefined && r < best) { best = r; bi = i; }
+    }
+    if (bi < 0) break;
+    parts.splice(bi, 2, parts[bi] + parts[bi + 1]);
+  }
+  tok.cache.set(word, parts);
+  return parts;
+}
+
+function encodeText(text) {
+  const ids = [];
+  for (const m of text.normalize('NFC').matchAll(PAT)) {
+    const mapped = Array.from(utf8.encode(m[0]), b => byteToChar[b]).join('');
+    for (const p of bpe(mapped)) {
+      const id = tok.vocab.get(p);
+      if (id !== undefined) ids.push(id);
+    }
+  }
+  return ids;
+}
+
+// ids -> bytes -> texto (ignora tokens especiales)
+function decodeIds(ids) {
+  const bytes = [];
+  for (const id of ids) {
+    if (tok.added.has(id)) continue;
+    const t = tok.idToTok[id];
+    if (!t) continue;
+    for (const ch of t) bytes.push(charToByte[ch]);
+  }
+  return utf8dec.decode(new Uint8Array(bytes));
+}
+
+// Plantilla ChatML de Qwen
+function buildPrompt(msgs) {
+  const ids = [];
+  const turn = (role, content) => {
+    ids.push(tok.IM_START, ...encodeText(role + '\n' + content), tok.IM_END, ...encodeText('\n'));
+  };
+  turn('system', SYSTEM);
+  for (const m of msgs) turn(m.role, m.content);
+  ids.push(tok.IM_START, ...encodeText('assistant\n'));
+  return ids;
+}
+
+/* =====================================================================
+   Inferencia: bucle con caché KV
+   ===================================================================== */
+let H2F = null;
+function halfToFloatTable() {
+  if (H2F) return H2F;
+  H2F = new Float32Array(65536);
+  for (let h = 0; h < 65536; h++) {
+    const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 0x1f, f = h & 0x3ff;
+    H2F[h] = e === 0 ? s * 5.960464477539063e-8 * f
+           : e === 31 ? (f ? NaN : s * Infinity)
+           : s * Math.pow(2, e - 15) * (1 + f / 1024);
+  }
+  return H2F;
+}
+
+function emptyPast() {
+  const past = {};
+  for (const name of session.inputNames) {
+    if (!name.startsWith('past_key_values')) continue;
+    past[name] = FP16
+      ? new ort.Tensor('float16', new Uint16Array(0), [1, KV_HEADS, 0, HEAD_DIM])
+      : new ort.Tensor('float32', new Float32Array(0), [1, KV_HEADS, 0, HEAD_DIM]);
+  }
+  return past;
+}
+
+// Ejecuta n tokens; devuelve los logits del ÚLTIMO token (Float32Array) y la nueva caché
+async function step(tokenIds, pastLen, past) {
+  const n = tokenIds.length;
+  const feeds = { ...past };
+  feeds.input_ids = new ort.Tensor('int64', BigInt64Array.from(tokenIds, BigInt), [1, n]);
+  feeds.attention_mask = new ort.Tensor('int64', new BigInt64Array(pastLen + n).fill(1n), [1, pastLen + n]);
+  if (session.inputNames.includes('position_ids')) {
+    feeds.position_ids = new ort.Tensor('int64', BigInt64Array.from({ length: n }, (_, i) => BigInt(pastLen + i)), [1, n]);
+  }
+  const out = await session.run(feeds);
+
+  const lg = out.logits;
+  const V = lg.dims[lg.dims.length - 1], rows = lg.dims[lg.dims.length - 2];
+  const data = lg.data, off = (rows - 1) * V;
+  let last;
+  if (data instanceof Uint16Array) {            // fp16 crudo
+    const T = halfToFloatTable();
+    last = new Float32Array(V);
+    for (let i = 0; i < V; i++) last[i] = T[data[off + i]];
+  } else {
+    last = Float32Array.from(data.subarray(off, off + V));
+  }
+
+  const newPast = {};
+  for (const name of Object.keys(past)) newPast[name] = out[name.replace('past_key_values', 'present')];
+  return { last, newPast };
+}
+
+function sample(logits, generated) {
+  // penalización de repetición sobre los últimos 256 tokens
+  for (const id of new Set(generated.slice(-256))) {
+    const l = logits[id];
+    logits[id] = l > 0 ? l / REP_PEN : l * REP_PEN;
+  }
+  if (TEMP <= 0) { let b = 0; for (let i = 1; i < logits.length; i++) if (logits[i] > logits[b]) b = i; return b; }
+
+  // top-k
+  const vals = new Float32Array(TOP_K).fill(-Infinity), idx = new Int32Array(TOP_K);
+  let minV = -Infinity, minP = 0;
+  for (let i = 0; i < logits.length; i++) {
+    const v = logits[i];
+    if (v > minV) {
+      vals[minP] = v; idx[minP] = i;
+      minV = vals[0]; minP = 0;
+      for (let j = 1; j < TOP_K; j++) if (vals[j] < minV) { minV = vals[j]; minP = j; }
+    }
+  }
+  const order = Array.from({ length: TOP_K }, (_, i) => i).sort((a, b) => vals[b] - vals[a]);
+  const mx = vals[order[0]];
+  let probs = order.map(i => Math.exp((vals[i] - mx) / TEMP));
+  const sum = probs.reduce((a, b) => a + b, 0);
+  probs = probs.map(p => p / sum);
+  // top-p
+  let acc = 0, cut = probs.length;
+  for (let i = 0; i < probs.length; i++) { acc += probs[i]; if (acc >= TOP_P) { cut = i + 1; break; } }
+  const tot = probs.slice(0, cut).reduce((a, b) => a + b, 0);
+  let r = Math.random() * tot;
+  for (let i = 0; i < cut; i++) { r -= probs[i]; if (r <= 0) return idx[order[i]]; }
+  return idx[order[0]];
+}
+
+async function generate(msgs, onText) {
+  let ids = buildPrompt(msgs);
+  // si el historial es demasiado largo, descarta los turnos más antiguos
+  while (ids.length > MAX_CTX && msgs.length > 1) { msgs.splice(0, 2); ids = buildPrompt(msgs); }
+
+  let past = emptyPast(), pastLen = 0, last;
+  for (let i = 0; i < ids.length; i += PREFILL_CHUNK) {
+    const chunk = ids.slice(i, i + PREFILL_CHUNK);
+    ({ last, newPast: past } = await step(chunk, pastLen, past));
+    pastLen += chunk.length;
+    statusEl.textContent = `Procesando prompt… ${Math.min(i + PREFILL_CHUNK, ids.length)}/${ids.length}`;
+    if (stopFlag) return { text: '', n: 0 };
+  }
+
+  const gen = [];
+  let lastRender = 0, text = '';
+  statusEl.textContent = 'Generando…';
+  while (gen.length < MAX_NEW && !stopFlag) {
+    const next = sample(last, gen);
+    if (next === tok.IM_END || next === tok.EOT) break;
+    gen.push(next);
+
+    const now = performance.now();
+    if (now - lastRender > 50) {
+      text = decodeIds(gen);
+      onText(text.replace(/\uFFFD+$/, ''));   // evita mostrar un carácter UTF-8 a medias
+      lastRender = now;
+      await new Promise(r => setTimeout(r));   // cede al navegador para pintar
+    }
+    ({ last, newPast: past } = await step([next], pastLen, past));
+    pastLen++;
+  }
+  text = decodeIds(gen);
+  return { text, n: gen.length };
+}
+
+/* =====================================================================
+   Carga
+   ===================================================================== */
+async function loadModel() {
+  try {
+    statusEl.textContent = 'Cargando tokenizador…';
+    await loadTokenizer();
+    statusEl.textContent = 'Descargando modelo… (puede tardar)';
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['wasm'] });
+    statusEl.textContent = 'Modelo listo';
+    input.disabled = false; sendBtn.disabled = false; input.focus();
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = 'Error cargando: ' + errMsg(e);
+  }
+}
+
+const errMsg = e => (e && e.message) ? e.message : (typeof e === 'number' ? 'excepción WASM #' + e : String(e));
+
+/* =====================================================================
+   Render de mensajes
+   ===================================================================== */
+const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const inline = s => esc(s).replace(/`([^`\n]+)`/g, '<code>$1</code>');
+
+function render(container, text, typing) {
+  container.innerHTML = '';
+  const re = /```([^\n`]*)\n?([\s\S]*?)(```|$)/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) addText(container, text.slice(last, m.index));
+    addCode(container, m[1].trim(), m[2]);
+    last = re.lastIndex;
+    if (m[0] === '') re.lastIndex++;
+  }
+  if (last < text.length) addText(container, text.slice(last));
+  container.classList.toggle('typing', !!typing);
+}
+
+function addText(container, t) {
+  t = t.replace(/^\n+|\n+$/g, '');
+  if (!t) return;
+  const p = document.createElement('div');
+  p.className = 'text';
+  p.innerHTML = inline(t);
+  container.appendChild(p);
+}
+
+function addCode(container, lang, code) {
+  const box = document.createElement('div');
+  box.className = 'codeblock';
+  const head = document.createElement('div');
+  head.className = 'codehead';
+  const l = document.createElement('span'); l.textContent = lang || 'código';
+  const btn = document.createElement('button'); btn.textContent = 'Copiar';
+  btn.onclick = async () => {
+    await navigator.clipboard.writeText(code.replace(/\n$/, ''));
+    btn.textContent = '¡Copiado!'; setTimeout(() => btn.textContent = 'Copiar', 1500);
+  };
+  head.append(l, btn);
+  const pre = document.createElement('pre');
+  const c = document.createElement('code');
+  c.textContent = code.replace(/\n$/, '');
+  pre.appendChild(c);
+  box.append(head, pre);
+  container.appendChild(box);
+}
+
+function addRow(role, text = '') {
+  $('empty')?.remove();
+  const row = document.createElement('div');
+  row.className = 'row ' + (role === 'user' ? 'user' : 'bot');
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  if (role === 'user') bubble.textContent = text;
+  else {
+    const av = document.createElement('div'); av.className = 'avatar'; av.textContent = 'Q';
+    row.appendChild(av);
+  }
+  row.appendChild(bubble);
+  chat.appendChild(row);
+  chat.scrollTop = chat.scrollHeight;
+  return bubble;
+}
+
+/* =====================================================================
+   Envío
+   ===================================================================== */
+async function send() {
+  const text = input.value.trim();
+  if (!text || generating || !session) return;
+  input.value = ''; autosize();
+
+  addRow('user', text);
+  history.push({ role: 'user', content: text });
+  const bubble = addRow('bot');
+  render(bubble, '', true);
+
+  setGenerating(true);
+  stopFlag = false;
+  const t0 = performance.now();
+  let answer = '', n = 0;
+
+  try {
+    const r = await generate(history, t => {
+      render(bubble, t, true);
+      chat.scrollTop = chat.scrollHeight;
+    });
+    answer = r.text; n = r.n;
+  } catch (e) {
+    console.error(e);
+    answer = '[Error: ' + errMsg(e) + ']';
+  }
+
+  render(bubble, answer || '(sin respuesta)', false);
+  chat.scrollTop = chat.scrollHeight;
+  history.push({ role: 'assistant', content: answer });
+  const s = (performance.now() - t0) / 1000;
+  statusEl.textContent = `Listo · ${n} tokens en ${s.toFixed(1)} s`;
+  setGenerating(false);
+  input.focus();
+}
+
+function setGenerating(on) {
+  generating = on;
+  sendBtn.textContent = on ? '■' : '➤';
+  sendBtn.title = on ? 'Detener' : 'Enviar';
+  sendBtn.disabled = false;
+}
+
+sendBtn.onclick = () => generating ? (stopFlag = true) : send();
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+function autosize() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 200) + 'px'; }
+input.addEventListener('input', autosize);
+
+loadModel();
+</script>
+</body>
+</html>
