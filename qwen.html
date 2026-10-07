@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen2.5-Coder · WebGPU</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--bd:#2a2f3a;--tx:#e6e8ee;--mut:#8a91a0;--ac:#6ea8fe}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,sans-serif}
+header{padding:10px 16px;border-bottom:1px solid var(--bd);display:flex;gap:12px;align-items:center;justify-content:space-between}
+#status{color:var(--mut);font-size:13px}
+#ctxInfo{color:var(--mut);font-size:12px;white-space:nowrap}
+#chat{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:min(820px,92%);padding:10px 14px;border-radius:12px;white-space:pre-wrap;word-break:break-word}
+.user{align-self:flex-end;background:var(--ac);color:#06142b}
+.bot{align-self:flex-start;background:var(--card);border:1px solid var(--bd)}
+.msg pre{background:#0b0d11;border:1px solid var(--bd);border-radius:8px;padding:10px;overflow-x:auto;margin:8px 0;white-space:pre}
+.msg code{font-family:ui-monospace,Consolas,monospace;font-size:13px}
+form{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--bd)}
+textarea{flex:1;resize:none;height:48px;background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:10px;font:inherit}
+button{background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:0 16px;font:inherit;cursor:pointer}
+button.primary{background:var(--ac);color:#06142b;border-color:var(--ac)}
+button:disabled{opacity:.45;cursor:default}
+</style>
+</head>
+<body>
+<header>
+  <div><strong>Qwen2.5-Coder 1.5B</strong> <span id="status">Iniciando…</span></div>
+  <div style="display:flex;gap:10px;align-items:center"><span id="ctxInfo"></span><button id="bNew" type="button">Nueva conversación</button></div>
+</header>
+<div id="chat"></div>
+<form id="form">
+  <textarea id="input" placeholder="Escribe tu mensaje (Enter envía, Shift+Enter salto de línea)" disabled></textarea>
+  <button id="bStop" type="button" disabled>Parar</button>
+  <button id="bSend" class="primary" disabled>Enviar</button>
+</form>
+
+<script type="module">
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs';
+import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.3';
+
+// ---------- Configuración ----------
+const REPO = 'onnx-community/Qwen2.5-Coder-1.5B-Instruct';
+const BASE = `https://huggingface.co/${REPO}/resolve/main/onnx/`;
+const MODEL_FILE = 'model_fp16.onnx';
+const DATA_FILE  = 'model_fp16.onnx_data';   // null si el modelo es un solo archivo (p. ej. model_q4f16.onnx)
+const CACHE_NAME = 'modelos-onnx';
+const N_LAYERS = 28, N_KV_HEADS = 2, HEAD_DIM = 128;   // Qwen2.5-1.5B
+const CTX = 4096, MAX_NEW = 1024, TEMP = 0.7, TOP_K = 40, CHUNK = 256;
+const EOS = [151645, 151643], IM_END = 151645;
+const SYSTEM = 'Eres un asistente experto en programación. Responde en el idioma del usuario.';
+
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status'), chat = $('chat'), input = $('input');
+const bSend = $('bSend'), bStop = $('bStop'), bNew = $('bNew');
+
+let session, tokenizer;
+let past = {}, pastLen = 0, pending = [], firstTurn = true;
+let busy = false, abort = false;
+
+// ---------- Descarga con progreso y caché ----------
+async function fetchBytes(url) {
+  try {
+    const hit = await (await caches.open(CACHE_NAME)).match(url);
+    if (hit) return new Uint8Array(await hit.arrayBuffer());
+  } catch {}
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status + ' en ' + url);
+  const buf = await res.arrayBuffer();
+  try { (await caches.open(CACHE_NAME)).put(url, new Response(buf)); } catch {}
+  return new Uint8Array(buf);
+}
+
+// Para el archivo grande: se guarda en streaming (sin cargarlo en la RAM de JS) y se pasa como blob URL
+async function fetchBigAsBlobUrl(url, label) {
+  const cache = await caches.open(CACHE_NAME);
+  let hit = await cache.match(url);
+  if (!hit) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' en ' + url);
+    const total = +res.headers.get('content-length') || 0;
+    let got = 0, last = 0;
+    const counter = new TransformStream({
+      transform(chunk, ctl) {
+        got += chunk.length; ctl.enqueue(chunk);
+        const now = performance.now();
+        if (now - last > 250) {
+          last = now;
+          statusEl.textContent = `Descargando ${label}… ` + (total ? Math.round(got / total * 100) + '%' : (got / 1048576 | 0) + ' MB');
+        }
+      }
+    });
+    await cache.put(url, new Response(res.body.pipeThrough(counter), { headers: { 'content-type': 'application/octet-stream' } }));
+    hit = await cache.match(url);
+  }
+  statusEl.textContent = `Leyendo ${label} de la caché…`;
+  return URL.createObjectURL(await hit.blob());
+}
+
+// ---------- Carga del modelo ----------
+async function loadModel() {
+  const adapter = navigator.gpu && await navigator.gpu.requestAdapter();
+  if (!adapter) { statusEl.textContent = 'WebGPU no disponible (revisa chrome://gpu).'; return; }
+  if (MODEL_FILE.includes('fp16') && !adapter.features.has('shader-f16')) {
+    statusEl.textContent = 'Tu GPU/navegador no soporta shader-f16: cambia MODEL_FILE a una variante q4 / q4f16.'; return;
+  }
+  try {
+    statusEl.textContent = 'Cargando tokenizer…';
+    tokenizer = await AutoTokenizer.from_pretrained(REPO);
+
+    const bytes = await fetchBytes(BASE + MODEL_FILE);
+    const opts = { executionProviders: ['webgpu'], preferredOutputLocation: {} };
+    // El KV cache se queda en la GPU entre pasos y entre turnos
+    for (let i = 0; i < N_LAYERS; i++)
+      for (const k of ['key', 'value']) opts.preferredOutputLocation[`present.${i}.${k}`] = 'gpu-buffer';
+    if (DATA_FILE) opts.externalData = [{ path: DATA_FILE, data: await fetchBigAsBlobUrl(BASE + DATA_FILE, 'pesos (3,5 GB)') }];
+
+    statusEl.textContent = 'Inicializando WebGPU…';
+    session = await ort.InferenceSession.create(bytes, opts);
+    resetContext();
+    statusEl.textContent = 'Modelo listo (WebGPU, fp16).';
+    input.disabled = bSend.disabled = false; input.focus();
+  } catch (e) {
+    console.error(e);
+    statusEl.textContent = 'Error cargando el modelo: ' + e.message;
+  }
+}
+
+// ---------- KV cache ----------
+function resetContext() {
+  for (const t of Object.values(past)) { try { t.dispose(); } catch {} }
+  past = {}; pastLen = 0; pending = []; firstTurn = true;
+  for (let i = 0; i < N_LAYERS; i++)
+    for (const k of ['key', 'value'])
+      past[`past_key_values.${i}.${k}`] = new ort.Tensor('float16', new Uint16Array(0), [1, N_KV_HEADS, 0, HEAD_DIM]);
+  updateCtx();
+}
+const updateCtx = () => $('ctxInfo').textContent = `Contexto: ${pastLen} / ${CTX} tokens`;
+
+// Procesa SOLO los tokens nuevos; el historial ya está en el KV cache.
+async function forward(ids, wantLogits) {
+  const n = ids.length;
+  const out = await session.run({
+    input_ids: new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, n]),
+    attention_mask: new ort.Tensor('int64', new BigInt64Array(pastLen + n).fill(1n), [1, pastLen + n]),
+    position_ids: new ort.Tensor('int64', BigInt64Array.from({ length: n }, (_, i) => BigInt(pastLen + i)), [1, n]),
+    ...past
+  });
+  for (const t of Object.values(past)) { try { t.dispose(); } catch {} }
+  past = {};
+  for (let i = 0; i < N_LAYERS; i++)
+    for (const k of ['key', 'value']) past[`past_key_values.${i}.${k}`] = out[`present.${i}.${k}`];
+  pastLen += n;
+
+  let row = null;
+  if (wantLogits) {
+    const data = await out.logits.getData();
+    const V = out.logits.dims[2];
+    row = data.subarray((n - 1) * V, n * V);
+  }
+  out.logits.dispose();
+  return row;
+}
+
+function half2float(h) {
+  const s = h & 0x8000 ? -1 : 1, e = (h & 0x7C00) >> 10, f = h & 0x03FF;
+  if (e === 0) return s * 2 ** -14 * (f / 1024);
+  if (e === 0x1F) return f ? NaN : s * Infinity;
+  return s * 2 ** (e - 15) * (1 + f / 1024);
+}
+
+function sample(row) {
+  const f16 = row instanceof Uint16Array;
+  const vals = new Float32Array(TOP_K).fill(-Infinity), idx = new Int32Array(TOP_K);
+  let minI = 0;
+  for (let i = 0; i < row.length; i++) {
+    const v = f16 ? half2float(row[i]) : row[i];
+    if (v > vals[minI]) {
+      vals[minI] = v; idx[minI] = i;
+      minI = 0; for (let j = 1; j < TOP_K; j++) if (vals[j] < vals[minI]) minI = j;
+    }
+  }
+  let mx = -Infinity; for (const v of vals) if (v > mx) mx = v;
+  const p = Array.from(vals, v => Math.exp((v - mx) / TEMP));
+  let r = Math.random() * p.reduce((a, b) => a + b, 0);
+  for (let j = 0; j < TOP_K; j++) { r -= p[j]; if (r <= 0) return idx[j]; }
+  return idx[0];
+}
+
+// ---------- Generación ----------
+async function respond(userText, botEl) {
+  let text = firstTurn ? `<|im_start|>system\n${SYSTEM}<|im_end|>\n` : '\n';
+  text += `<|im_start|>user\n${userText}<|im_end|>\n<|im_start|>assistant\n`;
+
+  // Si el turno anterior se cortó sin cerrar, se cierra antes de seguir
+  const prefix = pending.length && !EOS.includes(pending[pending.length - 1]) ? [...pending, IM_END] : pending;
+  let ids = [...prefix, ...Array.from(tokenizer.encode(text))];
+  if (pastLen + ids.length + 32 > CTX) throw new Error('Contexto lleno. Pulsa «Nueva conversación».');
+  firstTurn = false;
+
+  let row = null;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const part = ids.slice(i, i + CHUNK);
+    row = await forward(part, i + CHUNK >= ids.length);
+  }
+
+  const gen = []; let last = null; const t0 = performance.now();
+  while (gen.length < MAX_NEW && pastLen < CTX - 1) {
+    const tok = sample(row);
+    last = tok;
+    if (EOS.includes(tok) || abort) break;
+    gen.push(tok);
+    botEl.innerHTML = render(tokenizer.decode(gen, { skip_special_tokens: true }));
+    chat.scrollTop = chat.scrollHeight;
+    row = await forward([tok], true);
+    updateCtx();
+  }
+  pending = last === null ? [] : [last];   // último token generado, aún sin pasar por el modelo
+  const tps = gen.length / ((performance.now() - t0) / 1000);
+  statusEl.textContent = `Listo · ${tps.toFixed(1)} tok/s`;
+  updateCtx();
+}
+
+// ---------- UI ----------
+const esc = s => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+function render(t) {
+  const parts = t.split('```');
+  return parts.map((p, i) => {
+    if (i % 2 === 0) return esc(p).replace(/`([^`\n]+)`/g, '<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+    return '<pre><code>' + esc(p.replace(/^[^\n]*\n/, '')) + '</code></pre>';
+  }).join('');
+}
+function addMsg(cls, html) {
+  const d = document.createElement('div'); d.className = 'msg ' + cls; d.innerHTML = html;
+  chat.appendChild(d); chat.scrollTop = chat.scrollHeight; return d;
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text || busy || !session) return;
+  input.value = ''; busy = true; abort = false;
+  bSend.disabled = bNew.disabled = true; bStop.disabled = false;
+  addMsg('user', esc(text));
+  const botEl = addMsg('bot', '…');
+  statusEl.textContent = 'Generando…';
+  try { await respond(text, botEl); }
+  catch (e) { console.error(e); botEl.textContent = 'Error: ' + e.message; statusEl.textContent = 'Error'; }
+  busy = false; bSend.disabled = bNew.disabled = false; bStop.disabled = true; input.focus();
+}
+
+$('form').addEventListener('submit', e => { e.preventDefault(); send(); });
+input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+bStop.onclick = () => abort = true;
+bNew.onclick = () => { if (busy) return; resetContext(); chat.innerHTML = ''; statusEl.textContent = 'Conversación nueva.'; };
+
+loadModel();
+</script>
+</body>
+</html>
