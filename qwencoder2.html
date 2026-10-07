@@ -74,7 +74,7 @@
 <script type="module">
 import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs';
 
-const MODEL_URL = 'https://huggingface.co/onnx-community/Qwen2.5-Coder-0.5B-Instruct/resolve/main/onnx/model_q4f16.onnx';
+const MODEL_URL = 'https://huggingface.co/onnx-community/Qwen2.5-Coder-0.5B-Instruct/resolve/main/onnx/model_int8.onnx'; // alternativas: model_q4.onnx, model_q4f16.onnx
 const TOKENIZER_URL = 'https://huggingface.co/onnx-community/Qwen2.5-Coder-0.5B-Instruct/resolve/main/tokenizer.json';
 
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
@@ -198,7 +198,7 @@ function emptyPast() {
   for (const name of session.inputNames) {
     if (!name.startsWith('past_key_values')) continue;
     past[name] = FP16
-      ? new ort.Tensor('float16', new Uint16Array(0), [1, KV_HEADS, 0, HEAD_DIM])
+      ? new ort.Tensor('float16', typeof Float16Array !== 'undefined' ? new Float16Array(0) : new Uint16Array(0), [1, KV_HEADS, 0, HEAD_DIM])
       : new ort.Tensor('float32', new Float32Array(0), [1, KV_HEADS, 0, HEAD_DIM]);
   }
   return past;
