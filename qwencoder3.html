@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<script src="coi-serviceworker.js"></script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat Qwen2.5-Coder 0.5B (ORT WASM)</title>
+<style>
+  :root {
+    --bg: #212121; --panel: #2f2f2f; --text: #ececec; --muted: #9b9b9b;
+    --border: #3a3a3a; --accent: #10a37f; --code-bg: #0d0d0d; --code-head: #1e1e1e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex;
+           justify-content: space-between; align-items: center; font-size: .95rem; }
+  header .title { font-weight: 600; }
+  #status { color: var(--muted); font-size: .8rem; }
+  #chat { flex: 1; overflow-y: auto; padding: 20px 0; }
+  .row { max-width: 760px; margin: 0 auto; padding: 10px 20px; display: flex; gap: 14px; }
+  .row.user { justify-content: flex-end; }
+  .avatar { flex: none; width: 28px; height: 28px; border-radius: 50%; background: var(--accent);
+            display: grid; place-items: center; font-size: .75rem; font-weight: 700; color: #fff; margin-top: 2px; }
+  .bubble { min-width: 0; line-height: 1.6; font-size: .97rem; }
+  .row.user .bubble { background: var(--panel); padding: 10px 16px; border-radius: 18px; max-width: 80%;
+                      white-space: pre-wrap; overflow-wrap: anywhere; }
+  .row.bot .bubble { flex: 1; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+  .text + .codeblock, .codeblock + .text { margin-top: 10px; }
+  .text code { background: #3a3a3a; padding: 1px 6px; border-radius: 4px; font-family: ui-monospace, Consolas, monospace; font-size: .88em; }
+  .codeblock { background: var(--code-bg); border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
+  .codehead { background: var(--code-head); display: flex; justify-content: space-between; align-items: center;
+              padding: 6px 12px; font-size: .78rem; color: var(--muted); }
+  .codehead button { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: .78rem; }
+  .codehead button:hover { color: var(--text); }
+  pre { margin: 0; padding: 14px; overflow-x: auto; }
+  pre code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .86rem;
+             line-height: 1.5; white-space: pre; tab-size: 4; display: block; }
+  .typing::after { content: "▍"; animation: blink 1s steps(2) infinite; margin-left: 2px; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #empty { text-align: center; margin-top: 18vh; color: var(--muted); }
+  #empty h2 { color: var(--text); font-weight: 600; }
+  footer { padding: 10px 20px 18px; }
+  #composer { max-width: 760px; margin: 0 auto; background: var(--panel); border-radius: 26px;
+              display: flex; align-items: flex-end; padding: 8px 8px 8px 18px; gap: 8px; }
+  #input { flex: 1; background: none; border: 0; outline: 0; color: var(--text); font: inherit;
+           resize: none; max-height: 200px; padding: 8px 0; line-height: 1.4; }
+  #send { width: 36px; height: 36px; border-radius: 50%; border: 0; background: #fff; color: #000;
+          cursor: pointer; font-size: 1rem; flex: none; }
+  #send:disabled { opacity: .35; cursor: default; }
+  .hint { text-align: center; color: var(--muted); font-size: .72rem; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">Qwen2.5-Coder 0.5B</span>
+  <span id="status">Cargando modelo…</span>
+</header>
+
+<div id="chat">
+  <div id="empty"><h2>¿En qué puedo ayudarte?</h2><p>Modelo local ejecutándose en tu navegador (WASM).</p></div>
+</div>
+
+<footer>
+  <div id="composer">
+    <textarea id="input" rows="1" placeholder="Escribe un mensaje…" disabled></textarea>
+    <button id="send" disabled title="Enviar">➤</button>
+  </div>
+  <div class="hint">Enter envía · Shift+Enter nueva línea. Un modelo de 0.5B puede equivocarse.</div>
+</footer>
+
+<script type="module">
+import {
+  pipeline,
+  TextStreamer,
+  env
+} from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm';
+
+
+/* ================================================================
+   CONFIGURACIÓN ONNX / WASM
+   ================================================================ */
+
+env.backends.onnx.wasm.numThreads = 4;
+
+
+/* ================================================================
+   MODELO
+   ================================================================ */
+
+const MODEL_ID = 'onnx-community/Qwen2.5-Coder-0.5B-Instruct';
+
+const MAX_NEW = 1024;
+
+const TEMP = 0.4;
+const TOP_K = 40;
+const TOP_P = 0.9;
+const REP_PEN = 1.05;
+
+const SYSTEM =
+  'Eres un asistente útil. Responde en el idioma del usuario. ' +
+  'Cuando muestres código, usa bloques con ``` y el nombre del lenguaje.';
+
+
+/* ================================================================
+   DOM
+   ================================================================ */
+
+const $ = id => document.getElementById(id);
+
+const chat = $('chat');
+const input = $('input');
+const sendBtn = $('send');
+const statusEl = $('status');
+
+
+/* ================================================================
+   ESTADO
+   ================================================================ */
+
+let generator = null;
+let generating = false;
+
+
+/* ================================================================
+   ERROR
+   ================================================================ */
+
+const errMsg = e =>
+  e?.message
+    ? e.message
+    : typeof e === 'number'
+      ? 'excepción WASM #' + e
+      : String(e);
+
+
+/* ================================================================
+   CARGA DEL MODELO
+   ================================================================ */
+
+async function loadModel() {
+
+  try {
+
+    statusEl.textContent = 'Preparando WASM…';
+
+    /*
+     * El progress_callback informa de:
+     *
+     * progress_total -> progreso global de todos los archivos
+     * progress       -> progreso de un archivo
+     * ready           -> pipeline completamente cargado
+     *
+     * Transformers.js además utiliza la caché del navegador.
+     */
+
+    generator = await pipeline(
+      'text-generation',
+      MODEL_ID,
+      {
+        dtype: 'q8',
+        device: 'wasm',
+
+        progress_callback: info => {
+
+          if (info.status === 'progress_total') {
+
+            const p = Math.round(info.progress || 0);
+
+            statusEl.textContent =
+              `Descargando modelo… ${p}%`;
+
+          } else if (info.status === 'progress') {
+
+            const p = Math.round(info.progress || 0);
+
+            statusEl.textContent =
+              `Descargando modelo… ${p}%`;
+
+          } else if (info.status === 'initiate') {
+
+            statusEl.textContent =
+              'Preparando modelo…';
+
+          } else if (info.status === 'done') {
+
+            statusEl.textContent =
+              'Modelo descargado. Inicializando WASM…';
+
+          } else if (info.status === 'ready') {
+
+            statusEl.textContent =
+              'Modelo cargado. Preparando motor…';
+          }
+        }
+      }
+    );
+
+
+    /* ============================================================
+       WARM-UP
+       ============================================================
+
+       La idea aquí es importante:
+
+       - El pipeline se crea UNA sola vez.
+       - ONNX Runtime inicializa WASM.
+       - Se inicializan las rutas de ejecución.
+       - Se ejecuta una inferencia mínima.
+       - Esperamos a que termine.
+
+       Esto NO conserva el KV cache para las preguntas posteriores.
+       Simplemente deja el runtime preparado.
+    */
+
+    statusEl.textContent =
+      'Calentando motor WASM…';
+
+    const warmupMessages = [
+      {
+        role: 'system',
+        content: SYSTEM
+      },
+      {
+        role: 'user',
+        content: 'Hola'
+      }
+    ];
+
+    const warmupStart = performance.now();
+
+    await generator(
+      warmupMessages,
+      {
+        max_new_tokens: 1,
+        do_sample: false
+      }
+    );
+
+    const warmupSeconds =
+      (performance.now() - warmupStart) / 1000;
+
+
+    /* ============================================================
+       LISTO
+       ============================================================ */
+
+    statusEl.textContent =
+      `Modelo listo · WASM · 4 hilos · calentado en ${warmupSeconds.toFixed(1)} s`;
+
+    input.disabled = false;
+    sendBtn.disabled = false;
+
+    /*
+     * El botón nunca se convierte en "Detener".
+     */
+    sendBtn.textContent = '➤';
+    sendBtn.title = 'Enviar';
+
+    input.focus();
+
+  } catch (e) {
+
+    console.error(e);
+
+    statusEl.textContent =
+      'Error cargando: ' + errMsg(e);
+  }
+}
+
+
+/* ================================================================
+   PROMPT
+   ================================================================ */
+
+function buildMessages(msgs) {
+
+  return [
+    {
+      role: 'system',
+      content: SYSTEM
+    },
+    ...msgs
+  ];
+}
+
+
+/* ================================================================
+   GENERACIÓN
+   ================================================================ */
+
+async function generate(msgs, onText) {
+
+  if (!generator) {
+    throw new Error(
+      'El modelo todavía no está cargado'
+    );
+  }
+
+  const messages = buildMessages(msgs);
+
+  let fullText = '';
+
+
+  /* ============================================================
+     STREAMER
+     ============================================================ */
+
+  const streamer = new TextStreamer(
+    generator.tokenizer,
+    {
+      skip_prompt: true,
+
+      callback_function: text => {
+
+        fullText += text;
+
+        onText(fullText);
+
+        chat.scrollTop =
+          chat.scrollHeight;
+      }
+    }
+  );
+
+
+  statusEl.textContent =
+    'Generando…';
+
+
+  /* ============================================================
+     INFERENCIA
+     ============================================================ */
+
+  const output = await generator(
+    messages,
+    {
+      max_new_tokens: MAX_NEW,
+
+      temperature: TEMP,
+      top_k: TOP_K,
+      top_p: TOP_P,
+
+      repetition_penalty: REP_PEN,
+
+      do_sample: TEMP > 0,
+
+      streamer
+    }
+  );
+
+
+  /* ============================================================
+     FALLBACK
+     ============================================================ */
+
+  if (!fullText) {
+
+    const result = output?.[0];
+
+    if (result?.generated_text) {
+
+      if (Array.isArray(
+        result.generated_text
+      )) {
+
+        const last =
+          result.generated_text.at(-1);
+
+        fullText =
+          typeof last?.content === 'string'
+            ? last.content
+            : String(last ?? '');
+
+      } else {
+
+        fullText =
+          String(result.generated_text);
+      }
+    }
+  }
+
+
+  return {
+    text: fullText,
+    n: estimateTokenCount(output)
+  };
+}
+
+
+/* ================================================================
+   ESTIMACIÓN DE TOKENS
+   ================================================================ */
+
+function estimateTokenCount(output) {
+
+  try {
+
+    const generated =
+      output?.[0]?.generated_text;
+
+    if (Array.isArray(generated)) {
+      return generated.length;
+    }
+
+    return 0;
+
+  } catch {
+
+    return 0;
+  }
+}
+
+
+/* ================================================================
+   RENDER
+   ================================================================ */
+
+const esc = s =>
+  s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+
+const inline = s =>
+  esc(s).replace(
+    /`([^`\n]+)`/g,
+    '<code>$1</code>'
+  );
+
+
+function render(container, text, typing) {
+
+  container.innerHTML = '';
+
+  const re =
+    /```([^\n`]*)\n?([\s\S]*?)(```|$)/g;
+
+  let last = 0;
+  let m;
+
+
+  while (
+    (m = re.exec(text)) !== null
+  ) {
+
+    if (m.index > last) {
+
+      addText(
+        container,
+        text.slice(last, m.index)
+      );
+    }
+
+
+    addCode(
+      container,
+      m[1].trim(),
+      m[2]
+    );
+
+
+    last = re.lastIndex;
+
+
+    if (m[0] === '') {
+      re.lastIndex++;
+    }
+  }
+
+
+  if (last < text.length) {
+
+    addText(
+      container,
+      text.slice(last)
+    );
+  }
+
+
+  container.classList.toggle(
+    'typing',
+    !!typing
+  );
+}
+
+
+function addText(container, t) {
+
+  t = t.replace(
+    /^\n+|\n+$/g,
+    ''
+  );
+
+  if (!t) return;
+
+
+  const p =
+    document.createElement('div');
+
+  p.className = 'text';
+
+  p.innerHTML =
+    inline(t);
+
+  container.appendChild(p);
+}
+
+
+function addCode(
+  container,
+  lang,
+  code
+) {
+
+  const box =
+    document.createElement('div');
+
+  box.className =
+    'codeblock';
+
+
+  const head =
+    document.createElement('div');
+
+  head.className =
+    'codehead';
+
+
+  const l =
+    document.createElement('span');
+
+  l.textContent =
+    lang || 'código';
+
+
+  const btn =
+    document.createElement('button');
+
+  btn.textContent =
+    'Copiar';
+
+
+  btn.onclick = async () => {
+
+    await navigator.clipboard.writeText(
+      code.replace(/\n$/, '')
+    );
+
+    btn.textContent =
+      '¡Copiado!';
+
+
+    setTimeout(
+      () => btn.textContent = 'Copiar',
+      1500
+    );
+  };
+
+
+  head.append(l, btn);
+
+
+  const pre =
+    document.createElement('pre');
+
+  const c =
+    document.createElement('code');
+
+
+  c.textContent =
+    code.replace(/\n$/, '');
+
+
+  pre.appendChild(c);
+
+  box.append(
+    head,
+    pre
+  );
+
+  container.appendChild(box);
+}
+
+
+/* ================================================================
+   FILAS DEL CHAT
+   ================================================================ */
+
+function addRow(
+  role,
+  text = ''
+) {
+
+  $('empty')?.remove();
+
+
+  const row =
+    document.createElement('div');
+
+  row.className =
+    'row ' +
+    (role === 'user'
+      ? 'user'
+      : 'bot');
+
+
+  const bubble =
+    document.createElement('div');
+
+  bubble.className =
+    'bubble';
+
+
+  if (role === 'user') {
+
+    bubble.textContent =
+      text;
+
+  } else {
+
+    const av =
+      document.createElement('div');
+
+    av.className =
+      'avatar';
+
+    av.textContent =
+      'Q';
+
+    row.appendChild(av);
+  }
+
+
+  row.appendChild(bubble);
+
+  chat.appendChild(row);
+
+  chat.scrollTop =
+    chat.scrollHeight;
+
+
+  return bubble;
+}
+
+
+/* ================================================================
+   ENVÍO
+   ================================================================ */
+
+async function send() {
+
+  const text =
+    input.value.trim();
+
+
+  if (
+    !text ||
+    generating ||
+    !generator
+  ) {
+    return;
+  }
+
+
+  input.value = '';
+
+  autosize();
+
+
+  addRow(
+    'user',
+    text
+  );
+
+
+  const bubble =
+    addRow('bot');
+
+
+  render(
+    bubble,
+    '',
+    true
+  );
+
+
+  generating = true;
+
+
+  /*
+   * Ya no existe "Detener".
+   * Mientras genera, simplemente bloqueamos el botón.
+   */
+
+  sendBtn.disabled = true;
+
+  sendBtn.textContent =
+    '➤';
+
+  sendBtn.title =
+    'Generando…';
+
+
+  input.disabled = true;
+
+
+  const t0 =
+    performance.now();
+
+
+  let answer = '';
+
+  let n = 0;
+
+
+  try {
+
+    /*
+     * IMPORTANTE:
+     *
+     * Solo se manda el mensaje actual.
+     * No se manda ningún historial anterior.
+     */
+
+    const r =
+      await generate(
+        [
+          {
+            role: 'user',
+            content: text
+          }
+        ],
+        text => {
+
+          render(
+            bubble,
+            text,
+            true
+          );
+
+          chat.scrollTop =
+            chat.scrollHeight;
+        }
+      );
+
+
+    answer =
+      r.text;
+
+    n =
+      r.n;
+
+
+  } catch (e) {
+
+    console.error(e);
+
+    answer =
+      '[Error: ' +
+      errMsg(e) +
+      ']';
+  }
+
+
+  render(
+    bubble,
+    answer || '(sin respuesta)',
+    false
+  );
+
+
+  chat.scrollTop =
+    chat.scrollHeight;
+
+
+  const seconds =
+    (performance.now() - t0) / 1000;
+
+
+  statusEl.textContent =
+    n > 0
+      ? `Listo · ${n} tokens en ${seconds.toFixed(1)} s`
+      : `Listo · ${seconds.toFixed(1)} s`;
+
+
+  generating = false;
+
+
+  input.disabled = false;
+
+  sendBtn.disabled = false;
+
+  sendBtn.textContent =
+    '➤';
+
+  sendBtn.title =
+    'Enviar';
+
+
+  input.focus();
+}
+
+
+/* ================================================================
+   BOTÓN
+   ================================================================ */
+
+sendBtn.onclick = () => {
+
+  if (!generating) {
+    send();
+  }
+};
+
+
+/* ================================================================
+   INPUT
+   ================================================================ */
+
+input.addEventListener(
+  'keydown',
+  e => {
+
+    if (
+      e.key === 'Enter' &&
+      !e.shiftKey
+    ) {
+
+      e.preventDefault();
+
+      send();
+    }
+  }
+);
+
+
+/* ================================================================
+   AUTOSIZE
+   ================================================================ */
+
+function autosize() {
+
+  input.style.height =
+    'auto';
+
+
+  input.style.height =
+    Math.min(
+      input.scrollHeight,
+      200
+    ) + 'px';
+}
+
+
+input.addEventListener(
+  'input',
+  autosize
+);
+
+
+/* ================================================================
+   ARRANQUE
+   ================================================================ */
+
+loadModel();
+
+</script>
+</body>
+</html>
