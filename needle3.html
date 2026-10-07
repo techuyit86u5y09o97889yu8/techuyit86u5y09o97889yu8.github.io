@@ -521,10 +521,59 @@
 </main>
 
 
+
 <script type="module">
 
+/* ============================================================
+   ONNX RUNTIME WEB — WASM
+   ============================================================ */
+
 import * as ort from
-  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/+esm";
+  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.wasm.min.mjs";
+
+
+/*
+ * IMPORTANTE:
+ *
+ * Los archivos:
+ *
+ *   ort-wasm-simd-threaded.mjs
+ *   ort-wasm-simd-threaded.wasm
+ *
+ * se descargan directamente desde jsDelivr.
+ *
+ * No hace falta copiarlos al repositorio.
+ */
+
+ort.env.wasm.wasmPaths =
+  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+
+
+/*
+ * Tu PC tiene 4 threads.
+ *
+ * ONNX Runtime cuenta el thread principal dentro
+ * de numThreads.
+ */
+
+ort.env.wasm.numThreads = 4;
+
+ort.env.wasm.simd = true;
+
+
+/*
+ * No usamos proxy worker.
+ *
+ * Esto evita que ONNX Runtime intente crear el
+ * worker proxy desde el bundle ESM cross-origin.
+ */
+
+ort.env.wasm.proxy = false;
+
+
+/* ============================================================
+   SENTENCEPIECE
+   ============================================================ */
 
 import {
   SentencePieceProcessor
@@ -549,22 +598,29 @@ const TOKENIZER_URL =
   BASE + "needle.model";
 
 
+/*
+ * Needle special tokens.
+ */
+
 const PAD_ID = 0;
 const EOS_ID = 1;
 const BOS_ID = 2;
 const TOOL_CALL_ID = 4;
 const TOOLS_ID = 5;
 
+
+/*
+ * Encoder context.
+ */
+
 const MAX_ENCODER_TOKENS = 1024;
+
+
+/*
+ * Tool calls son normalmente muy pequeños.
+ */
+
 const MAX_GENERATION_TOKENS = 64;
-
-
-/* ============================================================
-   WASM
-   ============================================================ */
-
-ort.env.wasm.numThreads = 4;
-ort.env.wasm.simd = true;
 
 
 /* ============================================================
@@ -575,7 +631,8 @@ const TOOLS = [
   {
     name: "set_timer",
 
-    description: "Establece un temporizador.",
+    description:
+      "Establece un temporizador.",
 
     parameters: {
       type: "object",
@@ -587,7 +644,9 @@ const TOOLS = [
         }
       },
 
-      required: ["time_human"]
+      required: [
+        "time_human"
+      ]
     }
   },
 
@@ -607,7 +666,9 @@ const TOOLS = [
         }
       },
 
-      required: ["city"]
+      required: [
+        "city"
+      ]
     }
   }
 ];
@@ -641,24 +702,33 @@ const resultMetaEl =
    ============================================================ */
 
 let tokenizer = null;
+
 let encoderSession = null;
+
 let decoderSession = null;
 
 let ready = false;
+
 let running = false;
 
 
 /* ============================================================
-   UTILS
+   HELPERS
    ============================================================ */
 
 function setStatus(text) {
+
   statusEl.textContent = text;
+
 }
 
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+
+  return new Promise(
+    resolve => setTimeout(resolve, ms)
+  );
+
 }
 
 
@@ -666,11 +736,16 @@ function idsTensor(ids) {
 
   return new ort.Tensor(
     "int64",
+
     BigInt64Array.from(
-      ids.map(Number).map(BigInt)
+      ids.map(
+        x => BigInt(x)
+      )
     ),
+
     [1, ids.length]
   );
+
 }
 
 
@@ -678,16 +753,23 @@ function tokenTensor(id) {
 
   return new ort.Tensor(
     "int64",
-    BigInt64Array.from([BigInt(id)]),
+
+    BigInt64Array.from([
+      BigInt(id)
+    ]),
+
     [1, 1]
   );
+
 }
 
 
 function argmax(data) {
 
   let bestIndex = 0;
+
   let bestValue = data[0];
+
 
   for (
     let i = 1;
@@ -695,13 +777,21 @@ function argmax(data) {
     i++
   ) {
 
-    if (data[i] > bestValue) {
+    if (
+      data[i] > bestValue
+    ) {
+
       bestValue = data[i];
+
       bestIndex = i;
+
     }
+
   }
 
+
   return bestIndex;
+
 }
 
 
@@ -714,9 +804,11 @@ function arrayBufferToBase64(buffer) {
   const bytes =
     new Uint8Array(buffer);
 
-  const chunkSize = 0x8000;
+  const chunkSize =
+    0x8000;
 
   let binary = "";
+
 
   for (
     let i = 0;
@@ -733,11 +825,17 @@ function arrayBufferToBase64(buffer) {
         )
       );
 
+
     binary +=
-      String.fromCharCode(...chunk);
+      String.fromCharCode(
+        ...chunk
+      );
+
   }
 
+
   return btoa(binary);
+
 }
 
 
@@ -747,11 +845,15 @@ function arrayBufferToBase64(buffer) {
 
 async function loadTokenizer() {
 
-  setStatus("Descargando tokenizer…");
+  setStatus(
+    "Descargando tokenizer…"
+  );
 
 
   const response =
-    await fetch(TOKENIZER_URL);
+    await fetch(
+      TOKENIZER_URL
+    );
 
 
   if (!response.ok) {
@@ -759,6 +861,7 @@ async function loadTokenizer() {
     throw new Error(
       `No se pudo descargar needle.model: HTTP ${response.status}`
     );
+
   }
 
 
@@ -766,11 +869,15 @@ async function loadTokenizer() {
     await response.arrayBuffer();
 
 
-  setStatus("Inicializando tokenizer…");
+  setStatus(
+    "Inicializando tokenizer…"
+  );
 
 
   const base64 =
-    arrayBufferToBase64(buffer);
+    arrayBufferToBase64(
+      buffer
+    );
 
 
   tokenizer =
@@ -778,12 +885,8 @@ async function loadTokenizer() {
 
 
   /*
-   * IMPORTANTE:
-   *
-   * En navegador la API de sentencepiece-js utiliza
-   * loadFromB64StringModel().
-   *
-   * No usamos spp.load(URL).
+   * API correcta para cargar un modelo binario
+   * SentencePiece desde navegador.
    */
 
   await tokenizer.loadFromB64StringModel(
@@ -792,60 +895,75 @@ async function loadTokenizer() {
 
 
   console.log(
-    "Needle tokenizer cargado"
+    "Needle tokenizer listo"
   );
+
 }
 
 
 /* ============================================================
-   MODELS
+   ONNX SESSIONS
    ============================================================ */
 
 async function loadModels() {
 
-  setStatus("Cargando encoder…");
+  setStatus(
+    "Cargando encoder ONNX…"
+  );
 
 
   encoderSession =
     await ort.InferenceSession.create(
       ENCODER_URL,
+
       {
-        executionProviders: ["wasm"]
+        executionProviders: [
+          "wasm"
+        ]
       }
     );
 
 
-  setStatus("Cargando decoder…");
+  setStatus(
+    "Cargando decoder ONNX…"
+  );
 
 
   decoderSession =
     await ort.InferenceSession.create(
       DECODER_URL,
+
       {
-        executionProviders: ["wasm"]
+        executionProviders: [
+          "wasm"
+        ]
       }
     );
 
 
   console.log(
-    "Encoder inputs:",
+    "Needle encoder inputs:",
     encoderSession.inputNames
   );
 
+
   console.log(
-    "Encoder outputs:",
+    "Needle encoder outputs:",
     encoderSession.outputNames
   );
 
+
   console.log(
-    "Decoder inputs:",
+    "Needle decoder inputs:",
     decoderSession.inputNames
   );
 
+
   console.log(
-    "Decoder outputs:",
+    "Needle decoder outputs:",
     decoderSession.outputNames
   );
+
 }
 
 
@@ -858,29 +976,20 @@ function buildEncoderInput(
   toolsJSON
 ) {
 
-  /*
-   * Needle utiliza:
-   *
-   * query tokens
-   * +
-   * <tools>
-   * +
-   * tools JSON
-   *
-   * El token <tools> es ID 5.
-   */
-
-
   const queryIds =
-    tokenizer.encodeIds(query);
+    tokenizer.encodeIds(
+      query
+    );
 
 
   const toolsIds =
-    tokenizer.encodeIds(toolsJSON);
+    tokenizer.encodeIds(
+      toolsJSON
+    );
 
 
   /*
-   * El formato oficial limita el encoder a 1024 tokens.
+   * Reservamos un token para <tools>.
    */
 
   const maxQueryLength =
@@ -915,11 +1024,16 @@ function buildEncoderInput(
     );
 
 
+  /*
+   * [query, <tools>, tools]
+   */
+
   return [
     ...q,
     TOOLS_ID,
     ...t
   ];
+
 }
 
 
@@ -940,7 +1054,9 @@ async function runEncoder(
 
 
   const input =
-    idsTensor(inputIds);
+    idsTensor(
+      inputIds
+    );
 
 
   const outputs =
@@ -958,42 +1074,54 @@ async function runEncoder(
     throw new Error(
       "El encoder no devolvió encoder_out."
     );
+
   }
 
 
   return encoderOut;
+
 }
 
 
 /* ============================================================
-   EMPTY KV CACHE
+   INITIAL KV
    ============================================================ */
 
 function createEmptyKV() {
 
   /*
-   * Needle:
+   * Needle decoder:
    *
-   * decoder layers = 8
-   * K/V             = 2
-   * batch           = 1
-   * KV heads        = 4
-   * past sequence   = 0
-   * head dimension  = 64
+   * layers     = 8
+   * K/V        = 2
+   * batch      = 1
+   * KV heads   = 4
+   * sequence   = 0
+   * head dim   = 64
    *
    * [8, 2, 1, 4, 0, 64]
    */
 
   return new ort.Tensor(
     "float32",
+
     new Float32Array(0),
-    [8, 2, 1, 4, 0, 64]
+
+    [
+      8,
+      2,
+      1,
+      4,
+      0,
+      64
+    ]
   );
+
 }
 
 
 /* ============================================================
-   DECODER
+   DECODER GENERATION
    ============================================================ */
 
 async function generate(
@@ -1005,11 +1133,10 @@ async function generate(
 
 
   /*
-   * Cactus/Needle comienza el decoder
-   * con EOS.
+   * Primer token.
    */
 
-  let nextInput =
+  let currentToken =
     EOS_ID;
 
 
@@ -1026,7 +1153,9 @@ async function generate(
       await decoderSession.run({
 
         decoder_input_ids:
-          tokenTensor(nextInput),
+          tokenTensor(
+            currentToken
+          ),
 
         encoder_out:
           encoderOut,
@@ -1037,15 +1166,9 @@ async function generate(
       });
 
 
-    /*
-     * El ONNX exportado devuelve:
-     *
-     * logits
-     * present_self_kv
-     */
-
     const logits =
       outputs.logits;
+
 
     const presentKV =
       outputs.present_self_kv;
@@ -1056,6 +1179,7 @@ async function generate(
       throw new Error(
         "El decoder no devolvió logits."
       );
+
     }
 
 
@@ -1064,12 +1188,12 @@ async function generate(
       throw new Error(
         "El decoder no devolvió present_self_kv."
       );
+
     }
 
 
     /*
-     * KV de este paso pasa a ser
-     * el KV del siguiente.
+     * KV del siguiente paso.
      */
 
     pastKV =
@@ -1080,31 +1204,36 @@ async function generate(
      * Greedy decoding.
      */
 
-    const token =
-      argmax(logits.data);
+    const nextToken =
+      argmax(
+        logits.data
+      );
 
 
     /*
-     * EOS termina la generación.
+     * EOS = final.
      */
 
     if (
-      token === EOS_ID
+      nextToken === EOS_ID
     ) {
 
       break;
+
     }
 
 
-    generated.push(token);
+    generated.push(
+      nextToken
+    );
 
-    nextInput =
-      token;
+
+    currentToken =
+      nextToken;
 
 
     /*
-     * Ceder el hilo al navegador
-     * periódicamente.
+     * Deja respirar al navegador.
      */
 
     if (
@@ -1112,11 +1241,14 @@ async function generate(
     ) {
 
       await sleep(0);
+
     }
+
   }
 
 
   return generated;
+
 }
 
 
@@ -1127,35 +1259,30 @@ async function generate(
 function decodeTokens(ids) {
 
   let text =
-    tokenizer.decodeIds(ids);
+    tokenizer.decodeIds(
+      ids
+    );
 
 
   /*
-   * El modelo genera:
-   *
-   * <tool_call> + JSON
-   *
-   * pero el resultado que queremos mostrar
-   * es solamente el JSON.
+   * Quitar <tool_call> si el modelo
+   * lo devuelve explícitamente.
    */
 
-  if (
-    text.startsWith("<tool_call>")
-  ) {
-
-    text =
-      text.slice(
-        "<tool_call>".length
-      );
-  }
+  text =
+    text.replace(
+      /^<tool_call>/,
+      ""
+    );
 
 
   return text.trim();
+
 }
 
 
 /* ============================================================
-   PARSE TOOL CALL
+   PARSE JSON
    ============================================================ */
 
 function parseToolCall(text) {
@@ -1165,7 +1292,7 @@ function parseToolCall(text) {
 
 
   /*
-   * Elimina posibles fences accidentales.
+   * Eliminar markdown accidental.
    */
 
   value =
@@ -1186,7 +1313,7 @@ function parseToolCall(text) {
 
 
   /*
-   * Buscar array JSON.
+   * Buscar array.
    */
 
   const arrayStart =
@@ -1214,14 +1341,13 @@ function parseToolCall(text) {
         candidate
       );
 
-    } catch {
-      // continuar
-    }
+    } catch {}
+
   }
 
 
   /*
-   * Buscar objeto JSON.
+   * Buscar objeto.
    */
 
   const objectStart =
@@ -1249,22 +1375,22 @@ function parseToolCall(text) {
         candidate
       );
 
-    } catch {
-      // continuar
-    }
+    } catch {}
+
   }
 
 
   throw new Error(
     "Needle no produjo JSON válido.\n\n" +
-    "Salida:\n" +
+    "Salida original:\n" +
     text
   );
+
 }
 
 
 /* ============================================================
-   RESULT UI
+   RESULT RENDER
    ============================================================ */
 
 function renderJSON(value) {
@@ -1277,39 +1403,47 @@ function renderJSON(value) {
     );
 
 
-  resultEl.innerHTML = "";
+  resultEl.innerHTML =
+    "";
 
 
   const block =
-    document.createElement("div");
+    document.createElement(
+      "div"
+    );
 
   block.className =
     "codeblock";
 
 
   const head =
-    document.createElement("div");
+    document.createElement(
+      "div"
+    );
 
   head.className =
     "codehead";
 
 
   const label =
-    document.createElement("span");
+    document.createElement(
+      "span"
+    );
 
   label.textContent =
     "json";
 
 
   const copy =
-    document.createElement("button");
+    document.createElement(
+      "button"
+    );
 
   copy.textContent =
     "Copiar";
 
 
-  copy.addEventListener(
-    "click",
+  copy.onclick =
     async () => {
 
       try {
@@ -1318,8 +1452,10 @@ function renderJSON(value) {
           json
         );
 
+
         copy.textContent =
           "Copiado";
+
 
         setTimeout(
           () => {
@@ -1329,49 +1465,78 @@ function renderJSON(value) {
           1200
         );
 
+
       } catch {
 
         copy.textContent =
           "Error";
+
       }
-    }
+
+    };
+
+
+  head.appendChild(
+    label
+  );
+
+  head.appendChild(
+    copy
   );
 
 
-  head.appendChild(label);
-  head.appendChild(copy);
-
-
   const pre =
-    document.createElement("pre");
+    document.createElement(
+      "pre"
+    );
 
 
   const code =
-    document.createElement("code");
+    document.createElement(
+      "code"
+    );
 
 
   code.textContent =
     json;
 
 
-  pre.appendChild(code);
+  pre.appendChild(
+    code
+  );
 
 
-  block.appendChild(head);
-  block.appendChild(pre);
+  block.appendChild(
+    head
+  );
+
+  block.appendChild(
+    pre
+  );
 
 
-  resultEl.appendChild(block);
+  resultEl.appendChild(
+    block
+  );
+
 }
 
 
+/* ============================================================
+   ERROR
+   ============================================================ */
+
 function renderError(error) {
 
-  resultEl.innerHTML = "";
+  resultEl.innerHTML =
+    "";
 
 
   const div =
-    document.createElement("div");
+    document.createElement(
+      "div"
+    );
+
 
   div.className =
     "error";
@@ -1379,11 +1544,17 @@ function renderError(error) {
 
   div.textContent =
     error instanceof Error
-      ? error.stack || error.message
+      ? (
+          error.stack ||
+          error.message
+        )
       : String(error);
 
 
-  resultEl.appendChild(div);
+  resultEl.appendChild(
+    div
+  );
+
 }
 
 
@@ -1399,11 +1570,12 @@ function initializeTools() {
       null,
       2
     );
+
 }
 
 
 /* ============================================================
-   RUN
+   MAIN EXECUTION
    ============================================================ */
 
 async function runNeedle() {
@@ -1412,7 +1584,9 @@ async function runNeedle() {
     !ready ||
     running
   ) {
+
     return;
+
   }
 
 
@@ -1421,7 +1595,9 @@ async function runNeedle() {
 
 
   if (!query) {
+
     return;
+
   }
 
 
@@ -1444,35 +1620,39 @@ async function runNeedle() {
     );
 
     return;
+
   }
 
 
   running = true;
 
+
   runEl.disabled = true;
+
   queryEl.disabled = true;
+
   toolsEl.disabled = true;
 
 
-  const started =
+  const start =
     performance.now();
 
 
   try {
 
-    /*
-     * --------------------------------------------------------
-     * 1. ENCODER
-     * --------------------------------------------------------
-     */
+    /* --------------------------------------------------------
+       1. ENCODER
+       -------------------------------------------------------- */
 
     setStatus(
-      "Ejecutando encoder…"
+      "Codificando consulta…"
     );
 
 
     const toolsJSON =
-      JSON.stringify(tools);
+      JSON.stringify(
+        tools
+      );
 
 
     const encoderOut =
@@ -1482,11 +1662,9 @@ async function runNeedle() {
       );
 
 
-    /*
-     * --------------------------------------------------------
-     * 2. DECODER
-     * --------------------------------------------------------
-     */
+    /* --------------------------------------------------------
+       2. DECODER
+       -------------------------------------------------------- */
 
     setStatus(
       "Generando tool call…"
@@ -1499,18 +1677,16 @@ async function runNeedle() {
       );
 
 
-    /*
-     * --------------------------------------------------------
-     * 3. TOKEN -> TEXT
-     * --------------------------------------------------------
-     */
+    /* --------------------------------------------------------
+       3. TOKENIZER
+       -------------------------------------------------------- */
 
     setStatus(
       "Decodificando…"
     );
 
 
-    const text =
+    const rawText =
       decodeTokens(
         generatedIds
       );
@@ -1518,25 +1694,23 @@ async function runNeedle() {
 
     console.log(
       "Needle raw output:",
-      text
+      rawText
     );
 
 
-    /*
-     * --------------------------------------------------------
-     * 4. TEXT -> JSON
-     * --------------------------------------------------------
-     */
+    /* --------------------------------------------------------
+       4. JSON
+       -------------------------------------------------------- */
 
     const toolCall =
-      parseToolCall(text);
+      parseToolCall(
+        rawText
+      );
 
 
-    /*
-     * --------------------------------------------------------
-     * 5. UI
-     * --------------------------------------------------------
-     */
+    /* --------------------------------------------------------
+       5. RESULTADO
+       -------------------------------------------------------- */
 
     renderJSON(
       toolCall
@@ -1545,12 +1719,14 @@ async function runNeedle() {
 
     const elapsed =
       performance.now() -
-      started;
+      start;
 
 
     resultMetaEl.textContent =
       `${generatedIds.length} tokens · ` +
-      `${(elapsed / 1000).toFixed(2)} s`;
+      `${(
+        elapsed / 1000
+      ).toFixed(2)} s`;
 
 
     setStatus(
@@ -1579,15 +1755,18 @@ async function runNeedle() {
       "Error"
     );
 
-
   } finally {
 
     running = false;
 
     runEl.disabled = false;
+
     queryEl.disabled = false;
+
     toolsEl.disabled = false;
+
   }
+
 }
 
 
@@ -1596,20 +1775,26 @@ async function runNeedle() {
    ============================================================ */
 
 document
-  .querySelectorAll(".example")
-  .forEach(button => {
+  .querySelectorAll(
+    ".example"
+  )
+  .forEach(
+    button => {
 
-    button.addEventListener(
-      "click",
-      () => {
+      button.addEventListener(
+        "click",
+        () => {
 
-        queryEl.value =
-          button.dataset.query;
+          queryEl.value =
+            button.dataset.query;
 
-        queryEl.focus();
-      }
-    );
-  });
+          queryEl.focus();
+
+        }
+      );
+
+    }
+  );
 
 
 /* ============================================================
@@ -1628,10 +1813,16 @@ queryEl.addEventListener(
       event.preventDefault();
 
       runNeedle();
+
     }
+
   }
 );
 
+
+/* ============================================================
+   BUTTON
+   ============================================================ */
 
 runEl.addEventListener(
   "click",
@@ -1640,7 +1831,7 @@ runEl.addEventListener(
 
 
 /* ============================================================
-   INIT
+   INITIALIZATION
    ============================================================ */
 
 async function init() {
@@ -1651,23 +1842,15 @@ async function init() {
 
 
     /*
-     * Tokenizer
+     * Tokenizer.
      */
 
     await loadTokenizer();
 
 
     /*
-     * ONNX sessions.
-     *
-     * Se crean UNA SOLA VEZ y permanecen
-     * en memoria entre ejecuciones.
+     * Las sesiones ONNX se crean una sola vez.
      */
-
-    setStatus(
-      "Cargando modelos ONNX…"
-    );
-
 
     await loadModels();
 
@@ -1676,7 +1859,9 @@ async function init() {
 
 
     queryEl.disabled = false;
+
     toolsEl.disabled = false;
+
     runEl.disabled = false;
 
 
@@ -1686,8 +1871,21 @@ async function init() {
 
 
     console.log(
-      "Needle listo."
+      "Needle inicializado correctamente."
     );
+
+
+    console.log(
+      "crossOriginIsolated:",
+      window.crossOriginIsolated
+    );
+
+
+    console.log(
+      "WASM threads:",
+      ort.env.wasm.numThreads
+    );
+
 
   } catch (error) {
 
@@ -1705,13 +1903,17 @@ async function init() {
     renderError(
       error
     );
+
   }
+
 }
 
 
 init();
 
 </script>
+
+
 
 </body>
 </html>
