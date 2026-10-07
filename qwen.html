@@ -26,7 +26,7 @@ button:disabled{opacity:.45;cursor:default}
 </head>
 <body>
 <header>
-  <div><strong>Qwen2.5-Coder 1.5B</strong> <span id="status">Iniciando…</span></div>
+  <div><strong>Qwen2.5-Coder 0.5B</strong> <span id="status">Iniciando…</span></div>
   <div style="display:flex;gap:10px;align-items:center"><span id="ctxInfo"></span><button id="bNew" type="button">Nueva conversación</button></div>
 </header>
 <div id="chat"></div>
@@ -43,11 +43,11 @@ import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transfo
 // ---------- Configuración ----------
 const REPO = 'onnx-community/Qwen2.5-Coder-0.5B-Instruct';
 const BASE = `https://huggingface.co/${REPO}/resolve/main/onnx/`;
-const MODEL_FILE = 'model_q4.onnx';   // 1,92 GB, un solo archivo, fp32: no requiere shader-f16
+const MODEL_FILE = 'model_q4.onnx';   // un solo archivo, fp32: no requiere shader-f16
 const DATA_FILE  = null;             // solo para modelos con .onnx_data (p. ej. model_fp16.onnx)
 const KV_TYPE = MODEL_FILE.includes('f16') ? 'float16' : 'float32';   // dtype del KV cache
 const CACHE_NAME = 'modelos-onnx';
-const N_LAYERS = 28, N_KV_HEADS = 2, HEAD_DIM = 128;   // Qwen2.5-1.5B
+const N_LAYERS = 24, N_KV_HEADS = 2, HEAD_DIM = 64;   // Qwen2.5-0.5B
 const CTX = 4096, MAX_NEW = 1024, TEMP = 0.7, TOP_K = 40, CHUNK = 256;
 const EOS = [151645, 151643], IM_END = 151645;
 const SYSTEM = 'Eres un asistente experto en programación. Responde en el idioma del usuario.';
@@ -75,30 +75,44 @@ async function fetchBytes(url) {
   return new Uint8Array(buf);
 }
 
-// Para el archivo grande: se guarda en streaming (sin cargarlo en la RAM de JS) y se pasa como blob URL
+// Archivo grande: se descarga a trozos (Blobs, que el navegador puede volcar a disco) y se pasa como blob URL.
+// Si no cabe en la caché (QuotaExceededError) se usa igualmente, solo en esta sesión.
 async function fetchBigAsBlobUrl(url, label) {
-  const cache = await caches.open(CACHE_NAME);
-  let hit = await cache.match(url);
-  if (!hit) {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('HTTP ' + res.status + ' en ' + url);
-    const total = +res.headers.get('content-length') || 0;
-    let got = 0, last = 0;
-    const counter = new TransformStream({
-      transform(chunk, ctl) {
-        got += chunk.length; ctl.enqueue(chunk);
-        const now = performance.now();
-        if (now - last > 250) {
-          last = now;
-          statusEl.textContent = `Descargando ${label}… ` + (total ? Math.round(got / total * 100) + '%' : (got / 1048576 | 0) + ' MB');
-        }
-      }
-    });
-    await cache.put(url, new Response(res.body.pipeThrough(counter), { headers: { 'content-type': 'application/octet-stream' } }));
-    hit = await cache.match(url);
+  let cache = null;
+  try {
+    cache = await caches.open(CACHE_NAME);
+    const hit = await cache.match(url);
+    if (hit) { statusEl.textContent = `Leyendo ${label} de la caché…`; return URL.createObjectURL(await hit.blob()); }
+  } catch {}
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status + ' en ' + url);
+  const total = +res.headers.get('content-length') || 0;
+  const reader = res.body.getReader();
+  const parts = []; let buf = [], bufSize = 0, got = 0, last = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf.push(value); bufSize += value.length; got += value.length;
+    if (bufSize >= 64 * 1048576) { parts.push(new Blob(buf)); buf = []; bufSize = 0; }
+    const now = performance.now();
+    if (now - last > 250) {
+      last = now;
+      statusEl.textContent = `Descargando ${label}… ` + (total ? Math.round(got / total * 100) + '%' : (got / 1048576 | 0) + ' MB');
+    }
   }
-  statusEl.textContent = `Leyendo ${label} de la caché…`;
-  return URL.createObjectURL(await hit.blob());
+  if (buf.length) parts.push(new Blob(buf));
+  const blob = new Blob(parts, { type: 'application/octet-stream' });
+
+  try {
+    statusEl.textContent = 'Guardando en caché…';
+    await cache.put(url, new Response(blob));
+  } catch (e) {
+    console.warn('No se pudo guardar en caché:', e);
+    statusEl.textContent = 'No cabe en la caché del navegador: se usará solo en esta sesión.';
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return URL.createObjectURL(blob);
 }
 
 // ---------- Carga del modelo ----------
@@ -112,7 +126,7 @@ async function loadModel() {
     statusEl.textContent = 'Cargando tokenizer…';
     tokenizer = await AutoTokenizer.from_pretrained(REPO);
 
-    const modelSrc = await fetchBigAsBlobUrl(BASE + MODEL_FILE, 'modelo (1,9 GB)');
+    const modelSrc = await fetchBigAsBlobUrl(BASE + MODEL_FILE, 'modelo');
     const opts = { executionProviders: ['webgpu'], preferredOutputLocation: {} };
     // El KV cache se queda en la GPU entre pasos y entre turnos
     for (let i = 0; i < N_LAYERS; i++)
