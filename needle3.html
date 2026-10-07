@@ -523,21 +523,6 @@
 
 <script type="module">
 
-/*
- * Needle — browser implementation
- *
- * Modelo:
- *   https://huggingface.co/onnx-community/needle-onnx
- *
- * Componentes:
- *   encoder.onnx
- *   decoder_step.onnx
- *   needle.model
- *
- * Backend:
- *   ONNX Runtime Web / WASM
- */
-
 import * as ort from
   "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/+esm";
 
@@ -551,57 +536,33 @@ import {
    CONFIG
    ============================================================ */
 
-const MODEL_BASE =
+const BASE =
   "https://huggingface.co/onnx-community/needle-onnx/resolve/main/";
 
 const ENCODER_URL =
-  MODEL_BASE + "encoder.onnx";
+  BASE + "encoder.onnx";
 
 const DECODER_URL =
-  MODEL_BASE + "decoder_step.onnx";
+  BASE + "decoder_step.onnx";
 
 const TOKENIZER_URL =
-  MODEL_BASE + "needle.model";
+  BASE + "needle.model";
 
 
-/*
- * Needle special token IDs.
- *
- * pad       = 0
- * eos       = 1
- * bos       = 2
- * unk       = 3
- * tool_call = 4
- * tools     = 5
- */
 const PAD_ID = 0;
 const EOS_ID = 1;
 const BOS_ID = 2;
 const TOOL_CALL_ID = 4;
 const TOOLS_ID = 5;
 
-
-/*
- * Encoder context.
- *
- * Needle's exported prompt format uses up to 1024 encoder
- * tokens.
- */
 const MAX_ENCODER_TOKENS = 1024;
+const MAX_GENERATION_TOKENS = 64;
 
 
-/*
- * Maximum generated tokens.
- *
- * Tool calls are normally very short. Keeping this reasonably
- * small also prevents an accidental runaway generation.
- */
-const MAX_GENERATION_TOKENS = 128;
+/* ============================================================
+   WASM
+   ============================================================ */
 
-
-/*
- * Four hardware threads, as requested.
- */
 ort.env.wasm.numThreads = 4;
 ort.env.wasm.simd = true;
 
@@ -614,8 +575,7 @@ const TOOLS = [
   {
     name: "set_timer",
 
-    description:
-      "Establece un temporizador.",
+    description: "Establece un temporizador.",
 
     parameters: {
       type: "object",
@@ -627,9 +587,7 @@ const TOOLS = [
         }
       },
 
-      required: [
-        "time_human"
-      ]
+      required: ["time_human"]
     }
   },
 
@@ -649,9 +607,7 @@ const TOOLS = [
         }
       },
 
-      required: [
-        "city"
-      ]
+      required: ["city"]
     }
   }
 ];
@@ -661,12 +617,23 @@ const TOOLS = [
    DOM
    ============================================================ */
 
-const statusEl = document.getElementById("status");
-const queryEl = document.getElementById("query");
-const toolsEl = document.getElementById("tools");
-const runEl = document.getElementById("run");
-const resultEl = document.getElementById("result");
-const resultMetaEl = document.getElementById("result-meta");
+const statusEl =
+  document.getElementById("status");
+
+const queryEl =
+  document.getElementById("query");
+
+const toolsEl =
+  document.getElementById("tools");
+
+const runEl =
+  document.getElementById("run");
+
+const resultEl =
+  document.getElementById("result");
+
+const resultMetaEl =
+  document.getElementById("result-meta");
 
 
 /* ============================================================
@@ -682,7 +649,7 @@ let running = false;
 
 
 /* ============================================================
-   HELPERS
+   UTILS
    ============================================================ */
 
 function setStatus(text) {
@@ -695,148 +662,82 @@ function sleep(ms) {
 }
 
 
-function tensorFromIds(ids) {
+function idsTensor(ids) {
 
   return new ort.Tensor(
     "int64",
     BigInt64Array.from(
-      ids.map(x => BigInt(x))
+      ids.map(Number).map(BigInt)
     ),
     [1, ids.length]
   );
 }
 
 
+function tokenTensor(id) {
+
+  return new ort.Tensor(
+    "int64",
+    BigInt64Array.from([BigInt(id)]),
+    [1, 1]
+  );
+}
+
+
 function argmax(data) {
 
-  let best = 0;
+  let bestIndex = 0;
   let bestValue = data[0];
 
-  for (let i = 1; i < data.length; i++) {
+  for (
+    let i = 1;
+    i < data.length;
+    i++
+  ) {
 
     if (data[i] > bestValue) {
       bestValue = data[i];
-      best = i;
+      bestIndex = i;
     }
-
   }
 
-  return best;
-}
-
-
-/*
- * Recursively convert ONNX output tensors to ordinary arrays.
- *
- * Mostly useful for debugging.
- */
-function tensorInfo(tensor) {
-
-  return {
-    dims: tensor.dims,
-    type: tensor.type,
-    size: tensor.size
-  };
+  return bestIndex;
 }
 
 
 /* ============================================================
-   RESULT RENDERER
+   ARRAYBUFFER -> BASE64
    ============================================================ */
 
-function renderJSON(value) {
+function arrayBufferToBase64(buffer) {
 
-  const json =
-    typeof value === "string"
-      ? value
-      : JSON.stringify(value, null, 2);
+  const bytes =
+    new Uint8Array(buffer);
 
-  resultEl.innerHTML = "";
+  const chunkSize = 0x8000;
 
-  const block =
-    document.createElement("div");
+  let binary = "";
 
-  block.className = "codeblock";
+  for (
+    let i = 0;
+    i < bytes.length;
+    i += chunkSize
+  ) {
 
-  const head =
-    document.createElement("div");
+    const chunk =
+      bytes.subarray(
+        i,
+        Math.min(
+          i + chunkSize,
+          bytes.length
+        )
+      );
 
-  head.className = "codehead";
+    binary +=
+      String.fromCharCode(...chunk);
+  }
 
-  const label =
-    document.createElement("span");
-
-  label.textContent = "json";
-
-  const copy =
-    document.createElement("button");
-
-  copy.textContent = "Copiar";
-
-  copy.onclick = async () => {
-
-    try {
-
-      await navigator.clipboard.writeText(json);
-
-      copy.textContent = "Copiado";
-
-      setTimeout(() => {
-        copy.textContent = "Copiar";
-      }, 1200);
-
-    } catch {
-      copy.textContent = "Error";
-    }
-
-  };
-
-  head.appendChild(label);
-  head.appendChild(copy);
-
-  const pre =
-    document.createElement("pre");
-
-  const code =
-    document.createElement("code");
-
-  code.textContent = json;
-
-  pre.appendChild(code);
-
-  block.appendChild(head);
-  block.appendChild(pre);
-
-  resultEl.appendChild(block);
-}
-
-
-function renderError(error) {
-
-  resultEl.innerHTML = "";
-
-  const div =
-    document.createElement("div");
-
-  div.className = "error";
-
-  div.textContent =
-    error instanceof Error
-      ? error.stack || error.message
-      : String(error);
-
-  resultEl.appendChild(div);
-}
-
-
-/* ============================================================
-   TOOL JSON
-   ============================================================ */
-
-function updateToolsEditor() {
-
-  toolsEl.value =
-    JSON.stringify(TOOLS, null, 2);
+  return btoa(binary);
 }
 
 
@@ -846,22 +747,64 @@ function updateToolsEditor() {
 
 async function loadTokenizer() {
 
-  setStatus("Cargando tokenizer…");
+  setStatus("Descargando tokenizer…");
+
+
+  const response =
+    await fetch(TOKENIZER_URL);
+
+
+  if (!response.ok) {
+
+    throw new Error(
+      `No se pudo descargar needle.model: HTTP ${response.status}`
+    );
+  }
+
+
+  const buffer =
+    await response.arrayBuffer();
+
+
+  setStatus("Inicializando tokenizer…");
+
+
+  const base64 =
+    arrayBufferToBase64(buffer);
+
 
   tokenizer =
     new SentencePieceProcessor();
 
-  await tokenizer.load(TOKENIZER_URL);
+
+  /*
+   * IMPORTANTE:
+   *
+   * En navegador la API de sentencepiece-js utiliza
+   * loadFromB64StringModel().
+   *
+   * No usamos spp.load(URL).
+   */
+
+  await tokenizer.loadFromB64StringModel(
+    base64
+  );
+
+
+  console.log(
+    "Needle tokenizer cargado"
+  );
 }
 
 
 /* ============================================================
-   MODEL LOADING
+   MODELS
    ============================================================ */
 
 async function loadModels() {
 
-  setStatus("Descargando encoder…");
+  setStatus("Cargando encoder…");
+
 
   encoderSession =
     await ort.InferenceSession.create(
@@ -872,7 +815,8 @@ async function loadModels() {
     );
 
 
-  setStatus("Descargando decoder…");
+  setStatus("Cargando decoder…");
+
 
   decoderSession =
     await ort.InferenceSession.create(
@@ -881,6 +825,27 @@ async function loadModels() {
         executionProviders: ["wasm"]
       }
     );
+
+
+  console.log(
+    "Encoder inputs:",
+    encoderSession.inputNames
+  );
+
+  console.log(
+    "Encoder outputs:",
+    encoderSession.outputNames
+  );
+
+  console.log(
+    "Decoder inputs:",
+    decoderSession.inputNames
+  );
+
+  console.log(
+    "Decoder outputs:",
+    decoderSession.outputNames
+  );
 }
 
 
@@ -888,46 +853,49 @@ async function loadModels() {
    ENCODER INPUT
    ============================================================ */
 
-/*
- * IMPORTANT:
- *
- * Needle does NOT use a conventional chat template.
- *
- * Encoder input:
- *
- *   query tokens
- *   +
- *   <tools>
- *   +
- *   tools JSON tokens
- *
- * The repo's inspection code explicitly documents this format.
- */
+function buildEncoderInput(
+  query,
+  toolsJSON
+) {
 
-function buildEncoderInput(query, toolsJSON) {
+  /*
+   * Needle utiliza:
+   *
+   * query tokens
+   * +
+   * <tools>
+   * +
+   * tools JSON
+   *
+   * El token <tools> es ID 5.
+   */
 
-  const queryTokens =
+
+  const queryIds =
     tokenizer.encodeIds(query);
 
-  const toolTokens =
+
+  const toolsIds =
     tokenizer.encodeIds(toolsJSON);
 
 
   /*
-   * Reserve:
-   *
-   * 1 token for <tools>
-   * 1 token of headroom used by the original format.
+   * El formato oficial limita el encoder a 1024 tokens.
    */
 
-  const maxQuery =
-    MAX_ENCODER_TOKENS - 2;
+  const maxQueryLength =
+    Math.max(
+      1,
+      MAX_ENCODER_TOKENS -
+      toolsIds.length -
+      1
+    );
 
 
   const q =
-    queryTokens.slice(
+    queryIds.slice(
       0,
-      maxQuery
+      maxQueryLength
     );
 
 
@@ -938,15 +906,14 @@ function buildEncoderInput(query, toolsJSON) {
 
 
   const t =
-    toolTokens.slice(
+    toolsIds.slice(
       0,
-      Math.max(0, remaining)
+      Math.max(
+        0,
+        remaining
+      )
     );
 
-
-  /*
-   * [query..., <tools>, tools...]
-   */
 
   return [
     ...q,
@@ -960,7 +927,10 @@ function buildEncoderInput(query, toolsJSON) {
    ENCODER
    ============================================================ */
 
-async function encodeQuery(query, toolsJSON) {
+async function runEncoder(
+  query,
+  toolsJSON
+) {
 
   const inputIds =
     buildEncoderInput(
@@ -969,87 +939,47 @@ async function encodeQuery(query, toolsJSON) {
     );
 
 
-  const inputTensor =
-    tensorFromIds(inputIds);
+  const input =
+    idsTensor(inputIds);
 
-
-  /*
-   * encoder.onnx:
-   *
-   * input_ids: [1, T]
-   *
-   * output:
-   *
-   * encoder_out: [1, T, 512]
-   */
 
   const outputs =
     await encoderSession.run({
-      input_ids: inputTensor
+      input_ids: input
     });
 
 
-  /*
-   * The exported model exposes encoder_out.
-   *
-   * We deliberately look it up rather than relying on
-   * object insertion order.
-   */
-
   const encoderOut =
-    outputs.encoder_out ||
-    outputs[encoderSession.outputNames[0]];
+    outputs.encoder_out;
 
 
   if (!encoderOut) {
 
     throw new Error(
-      "No se encontró encoder_out. Outputs: " +
-      encoderSession.outputNames.join(", ")
+      "El encoder no devolvió encoder_out."
     );
   }
 
 
-  return {
-    encoderOut,
-    inputIds
-  };
+  return encoderOut;
 }
 
 
 /* ============================================================
-   DECODER INPUT INSPECTION
+   EMPTY KV CACHE
    ============================================================ */
 
-function getDecoderNames() {
-
-  return {
-    inputs:
-      decoderSession.inputNames.slice(),
-
-    outputs:
-      decoderSession.outputNames.slice()
-  };
-}
-
-
-/* ============================================================
-   INITIAL KV CACHE
-   ============================================================ */
-
-function createInitialKV() {
+function createEmptyKV() {
 
   /*
-   * Needle decoder:
+   * Needle:
    *
-   * [decoder_layers, 2, batch, kv_heads, past_T, head_dim]
-   *
-   * 8 decoder layers
-   * 2 = K/V
-   * batch = 1
-   * 4 KV heads
-   * past_T = 0
-   * head_dim = 64
+   * decoder layers = 8
+   * K/V             = 2
+   * batch           = 1
+   * KV heads        = 4
+   * past sequence   = 0
+   * head dimension  = 64
    *
    * [8, 2, 1, 4, 0, 64]
    */
@@ -1066,19 +996,20 @@ function createInitialKV() {
    DECODER
    ============================================================ */
 
-async function generateToolCall(encoderOut) {
+async function generate(
+  encoderOut
+) {
 
   let pastKV =
-    createInitialKV();
+    createEmptyKV();
 
 
   /*
-   * Decoder starts from EOS.
-   *
-   * The model then predicts <tool_call> followed by JSON.
+   * Cactus/Needle comienza el decoder
+   * con EOS.
    */
 
-  let currentToken =
+  let nextInput =
     EOS_ID;
 
 
@@ -1091,201 +1022,54 @@ async function generateToolCall(encoderOut) {
     step++
   ) {
 
-    const decoderInput =
-      new ort.Tensor(
-        "int64",
-        BigInt64Array.from([
-          BigInt(currentToken)
-        ]),
-        [1, 1]
-      );
-
-
-    /*
-     * The exact graph uses explicit KV-cache I/O.
-     *
-     * We resolve names dynamically because ONNX exports can
-     * expose names slightly differently between versions.
-     */
-
-    const inputs =
-      decoderSession.inputNames;
-
-
-    const feeds = {};
-
-
-    for (const name of inputs) {
-
-      const lower =
-        name.toLowerCase();
-
-
-      if (
-        lower.includes("decoder_input") ||
-        lower === "input_ids" ||
-        lower.includes("input_ids")
-      ) {
-
-        feeds[name] =
-          decoderInput;
-
-        continue;
-      }
-
-
-      if (
-        lower.includes("encoder") &&
-        lower.includes("kv")
-      ) {
-
-        feeds[name] =
-          encoderOut;
-
-        continue;
-      }
-
-
-      if (
-        lower.includes("past") &&
-        lower.includes("kv")
-      ) {
-
-        feeds[name] =
-          pastKV;
-
-        continue;
-      }
-
-    }
-
-
-    /*
-     * Safety fallback for the expected three inputs.
-     */
-
-    if (
-      Object.keys(feeds).length !== inputs.length
-    ) {
-
-      throw new Error(
-        "No se pudieron resolver todos los inputs del decoder.\n\n" +
-        "Inputs encontrados:\n" +
-        inputs.join("\n") +
-        "\n\n" +
-        "Resueltos:\n" +
-        Object.keys(feeds).join("\n")
-      );
-    }
-
-
     const outputs =
-      await decoderSession.run(feeds);
+      await decoderSession.run({
+
+        decoder_input_ids:
+          tokenTensor(nextInput),
+
+        encoder_out:
+          encoderOut,
+
+        past_self_kv:
+          pastKV
+
+      });
 
 
     /*
-     * Find logits.
+     * El ONNX exportado devuelve:
+     *
+     * logits
+     * present_self_kv
      */
 
-    let logits = null;
-    let presentKV = null;
+    const logits =
+      outputs.logits;
 
+    const presentKV =
+      outputs.present_self_kv;
 
-    for (const name of decoderSession.outputNames) {
-
-      const out =
-        outputs[name];
-
-      const lower =
-        name.toLowerCase();
-
-
-      if (
-        lower.includes("logit")
-      ) {
-
-        logits = out;
-      }
-
-
-      if (
-        lower.includes("present") ||
-        lower.includes("kv")
-      ) {
-
-        if (
-          out.dims.length === 6
-        ) {
-
-          presentKV = out;
-        }
-
-      }
-
-    }
-
-
-    /*
-     * Fallback: first large tensor = logits,
-     * 6D tensor = KV.
-     */
 
     if (!logits) {
 
-      for (const name of decoderSession.outputNames) {
-
-        const out =
-          outputs[name];
-
-        if (
-          out.dims.length === 3
-        ) {
-
-          logits = out;
-          break;
-        }
-
-      }
-
-    }
-
-
-    if (!presentKV) {
-
-      for (const name of decoderSession.outputNames) {
-
-        const out =
-          outputs[name];
-
-        if (
-          out.dims.length === 6
-        ) {
-
-          presentKV = out;
-          break;
-        }
-
-      }
-
-    }
-
-
-    if (!logits) {
       throw new Error(
-        "No se encontraron logits en el decoder."
+        "El decoder no devolvió logits."
       );
     }
 
 
     if (!presentKV) {
+
       throw new Error(
-        "No se encontró el KV cache de salida."
+        "El decoder no devolvió present_self_kv."
       );
     }
 
 
     /*
-     * Save KV for the next decoder step.
+     * KV de este paso pasa a ser
+     * el KV del siguiente.
      */
 
     pastKV =
@@ -1293,38 +1077,34 @@ async function generateToolCall(encoderOut) {
 
 
     /*
-     * logits shape:
-     *
-     * [1, 1, vocab]
+     * Greedy decoding.
      */
 
-    const nextToken =
+    const token =
       argmax(logits.data);
 
 
     /*
-     * EOS finishes the tool call.
+     * EOS termina la generación.
      */
 
     if (
-      nextToken === EOS_ID
+      token === EOS_ID
     ) {
 
       break;
     }
 
 
-    generated.push(
-      nextToken
-    );
+    generated.push(token);
 
-
-    currentToken =
-      nextToken;
+    nextInput =
+      token;
 
 
     /*
-     * Yield to the browser so the UI remains responsive.
+     * Ceder el hilo al navegador
+     * periódicamente.
      */
 
     if (
@@ -1333,7 +1113,6 @@ async function generateToolCall(encoderOut) {
 
       await sleep(0);
     }
-
   }
 
 
@@ -1342,28 +1121,36 @@ async function generateToolCall(encoderOut) {
 
 
 /* ============================================================
-   DECODE RESULT
+   DECODE
    ============================================================ */
 
-function decodeToolCall(ids) {
+function decodeTokens(ids) {
+
+  let text =
+    tokenizer.decodeIds(ids);
+
 
   /*
-   * Needle normally generates:
+   * El modelo genera:
    *
-   * <tool_call> + JSON + EOS
+   * <tool_call> + JSON
    *
-   * Remove the tool_call marker if the model emitted it.
+   * pero el resultado que queremos mostrar
+   * es solamente el JSON.
    */
 
-  const clean =
-    ids.filter(
-      id =>
-        id !== TOOL_CALL_ID &&
-        id !== EOS_ID
-    );
+  if (
+    text.startsWith("<tool_call>")
+  ) {
+
+    text =
+      text.slice(
+        "<tool_call>".length
+      );
+  }
 
 
-  return tokenizer.decodeIds(clean);
+  return text.trim();
 }
 
 
@@ -1373,106 +1160,250 @@ function decodeToolCall(ids) {
 
 function parseToolCall(text) {
 
-  let cleaned =
+  let value =
     text.trim();
 
 
   /*
-   * Needle examples contain JSON such as:
-   *
-   * [{"name":"set_timer","arguments":{"time_human":"5 minutes"}}]
+   * Elimina posibles fences accidentales.
    */
 
-
-  /*
-   * Remove accidental markdown fences.
-   */
-
-  cleaned =
-    cleaned
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/\s*```$/i, "")
+  value =
+    value
+      .replace(
+        /^```json\s*/i,
+        ""
+      )
+      .replace(
+        /^```\s*/i,
+        ""
+      )
+      .replace(
+        /\s*```$/i,
+        ""
+      )
       .trim();
 
 
   /*
-   * Find the JSON array.
+   * Buscar array JSON.
    */
 
-  const start =
-    cleaned.indexOf("[");
+  const arrayStart =
+    value.indexOf("[");
 
-  const end =
-    cleaned.lastIndexOf("]");
+  const arrayEnd =
+    value.lastIndexOf("]");
 
 
   if (
-    start !== -1 &&
-    end !== -1 &&
-    end > start
+    arrayStart !== -1 &&
+    arrayEnd > arrayStart
   ) {
 
-    cleaned =
-      cleaned.slice(
-        start,
-        end + 1
+    const candidate =
+      value.slice(
+        arrayStart,
+        arrayEnd + 1
       );
-  }
 
 
-  try {
+    try {
 
-    return JSON.parse(cleaned);
+      return JSON.parse(
+        candidate
+      );
 
-  } catch {
-
-    /*
-     * Some outputs may be a single object.
-     */
-
-    const objStart =
-      cleaned.indexOf("{");
-
-    const objEnd =
-      cleaned.lastIndexOf("}");
-
-
-    if (
-      objStart !== -1 &&
-      objEnd !== -1 &&
-      objEnd > objStart
-    ) {
-
-      const candidate =
-        cleaned.slice(
-          objStart,
-          objEnd + 1
-        );
-
-      try {
-
-        return JSON.parse(
-          candidate
-        );
-
-      } catch {
-        // continue to error below
-      }
-
+    } catch {
+      // continuar
     }
-
-
-    throw new Error(
-      "La salida del modelo no es JSON válido.\n\n" +
-      text
-    );
   }
+
+
+  /*
+   * Buscar objeto JSON.
+   */
+
+  const objectStart =
+    value.indexOf("{");
+
+  const objectEnd =
+    value.lastIndexOf("}");
+
+
+  if (
+    objectStart !== -1 &&
+    objectEnd > objectStart
+  ) {
+
+    const candidate =
+      value.slice(
+        objectStart,
+        objectEnd + 1
+      );
+
+
+    try {
+
+      return JSON.parse(
+        candidate
+      );
+
+    } catch {
+      // continuar
+    }
+  }
+
+
+  throw new Error(
+    "Needle no produjo JSON válido.\n\n" +
+    "Salida:\n" +
+    text
+  );
 }
 
 
 /* ============================================================
-   EXECUTE
+   RESULT UI
+   ============================================================ */
+
+function renderJSON(value) {
+
+  const json =
+    JSON.stringify(
+      value,
+      null,
+      2
+    );
+
+
+  resultEl.innerHTML = "";
+
+
+  const block =
+    document.createElement("div");
+
+  block.className =
+    "codeblock";
+
+
+  const head =
+    document.createElement("div");
+
+  head.className =
+    "codehead";
+
+
+  const label =
+    document.createElement("span");
+
+  label.textContent =
+    "json";
+
+
+  const copy =
+    document.createElement("button");
+
+  copy.textContent =
+    "Copiar";
+
+
+  copy.addEventListener(
+    "click",
+    async () => {
+
+      try {
+
+        await navigator.clipboard.writeText(
+          json
+        );
+
+        copy.textContent =
+          "Copiado";
+
+        setTimeout(
+          () => {
+            copy.textContent =
+              "Copiar";
+          },
+          1200
+        );
+
+      } catch {
+
+        copy.textContent =
+          "Error";
+      }
+    }
+  );
+
+
+  head.appendChild(label);
+  head.appendChild(copy);
+
+
+  const pre =
+    document.createElement("pre");
+
+
+  const code =
+    document.createElement("code");
+
+
+  code.textContent =
+    json;
+
+
+  pre.appendChild(code);
+
+
+  block.appendChild(head);
+  block.appendChild(pre);
+
+
+  resultEl.appendChild(block);
+}
+
+
+function renderError(error) {
+
+  resultEl.innerHTML = "";
+
+
+  const div =
+    document.createElement("div");
+
+  div.className =
+    "error";
+
+
+  div.textContent =
+    error instanceof Error
+      ? error.stack || error.message
+      : String(error);
+
+
+  resultEl.appendChild(div);
+}
+
+
+/* ============================================================
+   TOOLS EDITOR
+   ============================================================ */
+
+function initializeTools() {
+
+  toolsEl.value =
+    JSON.stringify(
+      TOOLS,
+      null,
+      2
+    );
+}
+
+
+/* ============================================================
+   RUN
    ============================================================ */
 
 async function runNeedle() {
@@ -1517,13 +1448,13 @@ async function runNeedle() {
 
 
   running = true;
+
   runEl.disabled = true;
   queryEl.disabled = true;
+  toolsEl.disabled = true;
 
-  setStatus("Procesando…");
 
-
-  const start =
+  const started =
     performance.now();
 
 
@@ -1531,21 +1462,21 @@ async function runNeedle() {
 
     /*
      * --------------------------------------------------------
-     * 1. Encoder
+     * 1. ENCODER
      * --------------------------------------------------------
      */
 
-    setStatus("Codificando consulta…");
+    setStatus(
+      "Ejecutando encoder…"
+    );
 
 
     const toolsJSON =
       JSON.stringify(tools);
 
 
-    const {
-      encoderOut
-    } =
-      await encodeQuery(
+    const encoderOut =
+      await runEncoder(
         query,
         toolsJSON
       );
@@ -1553,35 +1484,47 @@ async function runNeedle() {
 
     /*
      * --------------------------------------------------------
-     * 2. Decoder + KV
+     * 2. DECODER
      * --------------------------------------------------------
      */
 
-    setStatus("Generando tool call…");
+    setStatus(
+      "Generando tool call…"
+    );
 
 
-    const ids =
-      await generateToolCall(
+    const generatedIds =
+      await generate(
         encoderOut
       );
 
 
     /*
      * --------------------------------------------------------
-     * 3. Decode
+     * 3. TOKEN -> TEXT
      * --------------------------------------------------------
      */
 
-    setStatus("Interpretando resultado…");
+    setStatus(
+      "Decodificando…"
+    );
 
 
     const text =
-      decodeToolCall(ids);
+      decodeTokens(
+        generatedIds
+      );
+
+
+    console.log(
+      "Needle raw output:",
+      text
+    );
 
 
     /*
      * --------------------------------------------------------
-     * 4. Parse JSON
+     * 4. TEXT -> JSON
      * --------------------------------------------------------
      */
 
@@ -1589,28 +1532,53 @@ async function runNeedle() {
       parseToolCall(text);
 
 
-    renderJSON(toolCall);
+    /*
+     * --------------------------------------------------------
+     * 5. UI
+     * --------------------------------------------------------
+     */
+
+    renderJSON(
+      toolCall
+    );
 
 
     const elapsed =
-      performance.now() - start;
+      performance.now() -
+      started;
 
 
     resultMetaEl.textContent =
-      `${ids.length} tokens · ${(elapsed / 1000).toFixed(2)} s`;
+      `${generatedIds.length} tokens · ` +
+      `${(elapsed / 1000).toFixed(2)} s`;
 
 
-    setStatus("Listo");
+    setStatus(
+      "Listo"
+    );
+
 
   } catch (error) {
 
-    console.error(error);
+    console.error(
+      "Needle error:",
+      error
+    );
 
-    renderError(error);
 
-    resultMetaEl.textContent = "";
+    renderError(
+      error
+    );
 
-    setStatus("Error");
+
+    resultMetaEl.textContent =
+      "";
+
+
+    setStatus(
+      "Error"
+    );
+
 
   } finally {
 
@@ -1618,13 +1586,13 @@ async function runNeedle() {
 
     runEl.disabled = false;
     queryEl.disabled = false;
-
+    toolsEl.disabled = false;
   }
 }
 
 
 /* ============================================================
-   EXAMPLE BUTTONS
+   EXAMPLES
    ============================================================ */
 
 document
@@ -1639,15 +1607,13 @@ document
           button.dataset.query;
 
         queryEl.focus();
-
       }
     );
-
   });
 
 
 /* ============================================================
-   KEYBOARD
+   ENTER
    ============================================================ */
 
 queryEl.addEventListener(
@@ -1663,7 +1629,6 @@ queryEl.addEventListener(
 
       runNeedle();
     }
-
   }
 );
 
@@ -1675,56 +1640,36 @@ runEl.addEventListener(
 
 
 /* ============================================================
-   INITIALIZATION
+   INIT
    ============================================================ */
 
 async function init() {
 
   try {
 
-    updateToolsEditor();
+    initializeTools();
 
 
     /*
-     * Load tokenizer first.
+     * Tokenizer
      */
 
     await loadTokenizer();
 
 
     /*
-     * Load both ONNX sessions once.
+     * ONNX sessions.
      *
-     * They remain alive for all subsequent requests.
+     * Se crean UNA SOLA VEZ y permanecen
+     * en memoria entre ejecuciones.
      */
+
+    setStatus(
+      "Cargando modelos ONNX…"
+    );
+
 
     await loadModels();
-
-
-    /*
-     * Show actual graph information in console.
-     * Useful if the exported ONNX graph changes names.
-     */
-
-    console.log(
-      "Needle encoder inputs:",
-      encoderSession.inputNames
-    );
-
-    console.log(
-      "Needle encoder outputs:",
-      encoderSession.outputNames
-    );
-
-    console.log(
-      "Needle decoder inputs:",
-      decoderSession.inputNames
-    );
-
-    console.log(
-      "Needle decoder outputs:",
-      decoderSession.outputNames
-    );
 
 
     ready = true;
@@ -1735,19 +1680,32 @@ async function init() {
     runEl.disabled = false;
 
 
-    setStatus("Modelo listo");
+    setStatus(
+      "Modelo listo"
+    );
 
+
+    console.log(
+      "Needle listo."
+    );
 
   } catch (error) {
 
-    console.error(error);
+    console.error(
+      "Initialization error:",
+      error
+    );
 
-    setStatus("Error al cargar");
 
-    renderError(error);
+    setStatus(
+      "Error al cargar"
+    );
 
+
+    renderError(
+      error
+    );
   }
-
 }
 
 
